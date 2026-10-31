@@ -115,7 +115,7 @@ Commercial Constraints: Hard expenditure ceiling of ₹${maxBudget.toLocaleStrin
 \`\`\`json
 {
   "intent": "REJECT_ALL",
-  "reasoning": "Every submitted proposal breached the hard ₹50,000 budget ceiling, failed the 48-hour delivery deadline, or concealed narrative fees.",
+  "reasoning": "Every submitted proposal breached the hard budget ceiling of ₹${this.configuration.maxBudget.toLocaleString()}, failed the 48-hour delivery deadline, or concealed narrative fees.",
   "counterOffers": [],
   "recommendedSellerRole": null,
   "explanation": "Procurement halted due to non-compliant bids across all competing suppliers."
@@ -134,7 +134,7 @@ Commercial Constraints: Hard expenditure ceiling of ₹${maxBudget.toLocaleStrin
         const winnerRole = topOffer.sellerType;
         const budgetSaved = this.configuration.maxBudget - topOffer.totalPrice;
         return `Apex Retail Procurement concludes Round ${roundNumber}. Supplier [${winnerRole}] satisfies all corporate mandates with a top utility score of ${topOffer.utilityScore}/100.
-Commercial Highlights: Total investment of ₹${topOffer.totalPrice.toLocaleString()} (saving ₹${budgetSaved.toLocaleString()} under our ₹50,000 ceiling), projected gross resale margin of ${topMargin}%, fulfillment within ${topOffer.deliveryHours} hours, and verified zero-trust security clearance.
+Commercial Highlights: Total investment of ₹${topOffer.totalPrice.toLocaleString()} (saving ₹${budgetSaved.toLocaleString()} under our ₹${this.configuration.maxBudget.toLocaleString()} ceiling), projected gross resale margin of ${topMargin}%, fulfillment within ${topOffer.deliveryHours} hours, and verified zero-trust security clearance.
 \`\`\`json
 {
   "intent": "DEAL_RECOMMENDATION",

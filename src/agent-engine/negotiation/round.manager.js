@@ -15,7 +15,7 @@ export class RoundManager {
     const maxRounds = options.maxRounds || this.DEFAULT_MAX_ROUNDS;
     const minRounds = options.minRounds || this.DEFAULT_MIN_ROUNDS;
     const targetUtility = options.targetUtility || this.DEFAULT_TARGET_UTILITY;
-    const maxBudget = options.maxBudget || 50000;
+    const maxBudget = options.maxBudget || 10000000;
     const maxDeliveryHours = options.maxDeliveryHours || 48;
 
     // Filter valid compliant offers (no hidden fees, within budget & delivery ceiling)

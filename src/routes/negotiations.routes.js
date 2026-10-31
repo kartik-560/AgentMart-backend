@@ -16,6 +16,7 @@ router.post('/', validateRequest({ body: createNegotiationSchema }), createNegot
 router.get('/:id', getNegotiationById);
 router.get('/:id/offers', getOffersByNegotiationId);
 router.post('/:id/advance-round', validateRequest({ body: advanceRoundSchema }), advanceNegotiationRound);
+router.post('/:id/advance', validateRequest({ body: advanceRoundSchema }), advanceNegotiationRound);
 router.get('/:id/comparison', getOfferComparison);
 
 export default router;

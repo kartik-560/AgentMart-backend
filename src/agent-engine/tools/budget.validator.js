@@ -4,7 +4,7 @@
  */
 
 export class BudgetValidator {
-  static HARD_MAX_BUDGET = 50000.00; // ₹50,000 procurement cap
+  static HARD_MAX_BUDGET = 10000000.00; // ₹50,000 procurement cap
   static HARD_MAX_DELIVERY_HOURS = 48; // 48-hour SLA ceiling
 
   /**

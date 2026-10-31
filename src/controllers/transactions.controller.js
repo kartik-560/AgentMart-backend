@@ -9,18 +9,29 @@ export async function getTransactions(req, res, next) {
     try {
       transactions = await prisma.transaction.findMany({
         include: {
-          buyerBusiness: { select: { name: true } },
-          sellerBusiness: { select: { name: true } },
-          offer: true,
-          approvedBy: { select: { name: true, role: true } },
+          buyerBusiness: { select: { id: true, name: true, registrationNumber: true } },
+          sellerBusiness: { select: { id: true, name: true, registrationNumber: true } },
+          offer: {
+            include: {
+              product: true,
+              sellerAgent: { select: { id: true, name: true, agentType: true } },
+              sellerBusiness: true,
+            },
+          },
+          negotiation: {
+            include: {
+              targetProduct: true,
+              buyerBusiness: true,
+              buyerAgent: { select: { id: true, name: true, agentType: true } },
+            },
+          },
+          approvedBy: { select: { id: true, name: true, role: true } },
         },
         orderBy: { createdAt: 'desc' },
       });
     } catch {
       // Fallback
     }
-
-
 
     return sendSuccess(res, transactions, 'Transactions retrieved');
   } catch (error) {
@@ -35,26 +46,32 @@ export async function getTransactionById(req, res, next) {
     try {
       tx = await prisma.transaction.findUnique({
         where: { id },
-        include: { offer: true, buyerBusiness: true, sellerBusiness: true },
+        include: {
+          offer: {
+            include: {
+              product: true,
+              sellerAgent: { select: { id: true, name: true, agentType: true } },
+              sellerBusiness: true,
+            },
+          },
+          negotiation: {
+            include: {
+              targetProduct: true,
+              buyerBusiness: true,
+              buyerAgent: { select: { id: true, name: true, agentType: true } },
+            },
+          },
+          buyerBusiness: true,
+          sellerBusiness: true,
+          approvedBy: { select: { id: true, name: true, role: true } },
+        },
       });
     } catch {
       // Fallback
     }
 
     if (!tx) {
-      tx = {
-        id,
-        negotiationId: 'neg-demo-001',
-        offerId: 'off-demo-a',
-        settlementAmount: 44400.00,
-        currency: 'INR',
-        paymentMethod: 'MOCK_UPI',
-        settlementStatus: 'PENDING_APPROVAL',
-        humanApprovalRequired: true,
-        mockUpiVpa: 'prismwholesale@icici',
-        buyerBusiness: { name: 'Apex Retail Enterprises' },
-        sellerBusiness: { name: 'Prism Wholesale Direct' },
-      };
+      return sendError(res, 'Transaction not found in database', 404, 'NotFound');
     }
 
     return sendSuccess(res, tx, 'Transaction retrieved');
@@ -76,99 +93,152 @@ export async function approveTransaction(req, res, next) {
     try {
       existingTx = await prisma.transaction.findUnique({
         where: { id },
-        include: { offer: { include: { product: { include: { inventory: true } } } }, buyerBusiness: { include: { businessMemory: true } } },
+        include: {
+          offer: {
+            include: {
+              product: { include: { inventory: true } },
+              sellerBusiness: true,
+              sellerAgent: true,
+            },
+          },
+          negotiation: {
+            include: {
+              targetProduct: true,
+              buyerBusiness: true,
+              buyerAgent: true,
+            },
+          },
+          buyerBusiness: { include: { businessMemory: true } },
+          sellerBusiness: true,
+        },
       });
     } catch {}
 
+    if (!existingTx) {
+      return sendError(res, 'Transaction not found in database', 404, 'NotFound');
+    }
+
     // Duplicate settlement protection
-    if (existingTx && existingTx.settlementStatus === 'SETTLED') {
+    if (existingTx.settlementStatus === 'SETTLED') {
       return sendError(res, 'Transaction is already settled. Duplicate settlement is strictly prohibited.', 409, 'DuplicateSettlementError');
+    }
+
+    if (existingTx.settlementStatus === 'REJECTED') {
+      return sendError(res, 'Transaction was rejected and cannot be settled.', 400, 'InvalidTransactionState');
     }
 
     const mockUpiRef = `UPI-TXN-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
     const settledAt = new Date();
-    const tamperProofHash = crypto.createHash('sha256').update(`${id}-${mockUpiRef}-${settledAt.toISOString()}`).digest('hex');
+    const tamperProofHash = crypto
+      .createHash('sha256')
+      .update(`${id}-${mockUpiRef}-${settledAt.toISOString()}-${existingTx.settlementAmount}`)
+      .digest('hex');
 
-    let settledRecord = null;
-    try {
-      settledRecord = await prisma.transaction.update({
-        where: { id },
-        data: {
-          settlementStatus: 'SETTLED',
-          approverSignature: approvedBy,
-          approvedAt: settledAt,
-          approvalNotes: approvalNotes || 'Authorized within deterministic threshold',
-          mockUpiReference: mockUpiRef,
-          mockUpiVpa: payerVpa || 'apexenterprise@hdfcbank',
-          settledAt,
-          tamperProofHash,
-        },
-      });
-
-      // Deduct inventory
-      if (existingTx?.offer?.product?.inventory) {
-        const inv = existingTx.offer.product.inventory;
-        const qty = existingTx.offer.quantity;
-        await prisma.inventory.update({
-          where: { id: inv.id },
-          data: {
-            stockQuantity: Math.max(0, inv.stockQuantity - qty),
-            reservedQuantity: Math.max(0, inv.reservedQuantity - qty),
-          },
-        });
-      }
-
-      // Record Business Memory outcome
-      if (existingTx?.buyerBusiness?.businessMemory) {
-        const mem = existingTx.buyerBusiness.businessMemory;
-        const updatedMem = BusinessMemoryEngine.recordTransactionOutcome(mem, {
-          supplierKey: 'seller-a-price',
-          wasSuccessful: true,
-          onTime: true,
-          hiddenFeeDetected: false,
-          actualMargin: Number(existingTx.offer?.resaleMarginProjected || 24.5),
-        });
-
-        await prisma.businessMemory.update({
-          where: { id: mem.id },
-          data: {
-            totalTransactions: updatedMem.totalTransactions,
-            successfulDeals: updatedMem.successfulDeals,
-            supplierReliability: updatedMem.supplierReliability,
-            recommendedPolicies: updatedMem.recommendedPolicies,
-          },
-        });
-      }
-
-      // Record immutable audit log
-      await prisma.auditLog.create({
-        data: {
-          entityType: 'TRANSACTION',
-          entityId: id,
-          action: 'SETTLED',
-          actorType: 'HUMAN',
-          actorId: approvedBy,
-          previousState: { status: 'PENDING_APPROVAL' },
-          newState: { status: 'SETTLED', mockUpiReference: mockUpiRef, amount: existingTx?.settlementAmount },
-          tamperProofHash,
-        },
-      });
-    } catch (err) {
-      // In-memory fallback
-      settledRecord = {
-        id,
+    const settledRecord = await prisma.transaction.update({
+      where: { id },
+      data: {
         settlementStatus: 'SETTLED',
-        humanApprovalRequired: true,
-        approvedBy,
         approverSignature: approvedBy,
-        approvedAt: settledAt.toISOString(),
-        approvalNotes: approvalNotes || 'Approved within authorized budget and delivery threshold',
+        approvedAt: settledAt,
+        approvalNotes: approvalNotes || 'Authorized within deterministic threshold',
         mockUpiReference: mockUpiRef,
-        mockUpiVpa: payerVpa || 'apexenterprise@hdfcbank',
-        settledAt: settledAt.toISOString(),
+        mockUpiVpa: payerVpa || existingTx.mockUpiVpa || 'apexenterprise@hdfcbank',
+        settledAt,
         tamperProofHash,
-      };
+      },
+      include: {
+        buyerBusiness: true,
+        sellerBusiness: true,
+        offer: {
+          include: {
+            product: true,
+            sellerAgent: true,
+            sellerBusiness: true,
+          },
+        },
+        negotiation: {
+          include: {
+            targetProduct: true,
+            buyerBusiness: true,
+            buyerAgent: true,
+          },
+        },
+      },
+    });
+
+    // Deduct inventory
+    if (existingTx?.offer?.product?.inventory) {
+      const inv = existingTx.offer.product.inventory;
+      const qty = existingTx.offer.quantity;
+      await prisma.inventory.update({
+        where: { id: inv.id },
+        data: {
+          stockQuantity: Math.max(0, inv.stockQuantity - qty),
+          reservedQuantity: Math.max(0, inv.reservedQuantity - qty),
+        },
+      });
     }
+
+    // Update Negotiation status to APPROVED
+    if (existingTx.negotiationId) {
+      try {
+        await prisma.negotiation.update({
+          where: { id: existingTx.negotiationId },
+          data: { status: 'APPROVED', recommendedOfferId: existingTx.offerId },
+        });
+      } catch {}
+    }
+
+    // Update Offer status to ACCEPTED
+    if (existingTx.offerId) {
+      try {
+        await prisma.offer.update({
+          where: { id: existingTx.offerId },
+          data: { status: 'ACCEPTED' },
+        });
+      } catch {}
+    }
+
+    // Record Business Memory outcome
+    if (existingTx?.buyerBusiness?.businessMemory) {
+      const mem = existingTx.buyerBusiness.businessMemory;
+      const updatedMem = BusinessMemoryEngine.recordTransactionOutcome(mem, {
+        supplierKey: existingTx.offer?.sellerAgent?.agentType || 'seller-a-price',
+        wasSuccessful: true,
+        onTime: true,
+        hiddenFeeDetected: false,
+        actualMargin: Number(existingTx.offer?.resaleMarginProjected || 24.5),
+      });
+
+      await prisma.businessMemory.update({
+        where: { id: mem.id },
+        data: {
+          totalTransactions: updatedMem.totalTransactions,
+          successfulDeals: updatedMem.successfulDeals,
+          supplierReliability: updatedMem.supplierReliability,
+          recommendedPolicies: updatedMem.recommendedPolicies,
+        },
+      });
+    }
+
+    // Record immutable audit log
+    await prisma.auditLog.create({
+      data: {
+        entityType: 'TRANSACTION',
+        entityId: id,
+        action: 'SETTLED',
+        actorType: 'HUMAN',
+        actorId: approvedBy,
+        previousState: { status: 'PENDING_APPROVAL' },
+        newState: {
+          status: 'SETTLED',
+          mockUpiReference: mockUpiRef,
+          amount: Number(existingTx.settlementAmount),
+          settledAt: settledAt.toISOString(),
+        },
+        tamperProofHash,
+      },
+    });
 
     // Emit live confirmation event via Socket.IO
     const io = req.app.get('io');
@@ -187,48 +257,96 @@ export async function rejectTransaction(req, res, next) {
     const { id } = req.params;
     const { rejectedBy, rejectionReason } = req.body;
 
-    let rejectedRecord = null;
-    try {
-      rejectedRecord = await prisma.transaction.update({
-        where: { id },
-        data: {
-          settlementStatus: 'REJECTED',
-          rejectionReason,
-        },
-      });
+    const existingTx = await prisma.transaction.findUnique({
+      where: { id },
+      include: {
+        offer: { include: { product: { include: { inventory: true } } } },
+      },
+    });
 
-      // Release inventory if offer exists
-      const tx = await prisma.transaction.findUnique({
-        where: { id },
-        include: { offer: { include: { product: { include: { inventory: true } } } } },
-      });
-      if (tx?.offer?.product?.inventory) {
-        await prisma.inventory.update({
-          where: { id: tx.offer.product.inventory.id },
-          data: {
-            reservedQuantity: Math.max(0, tx.offer.product.inventory.reservedQuantity - tx.offer.quantity),
-          },
-        });
-      }
+    if (!existingTx) {
+      return sendError(res, 'Transaction not found in database', 404, 'NotFound');
+    }
 
-      await prisma.auditLog.create({
-        data: {
-          entityType: 'TRANSACTION',
-          entityId: id,
-          action: 'REJECTED',
-          actorType: 'HUMAN',
-          actorId: rejectedBy || 'operator',
-          newState: { status: 'REJECTED', reason: rejectionReason },
-        },
-      });
-    } catch {
-      rejectedRecord = {
-        id,
+    if (existingTx.settlementStatus === 'SETTLED') {
+      return sendError(res, 'Cannot reject an already settled transaction', 400, 'InvalidTransactionState');
+    }
+
+    if (existingTx.settlementStatus === 'REJECTED') {
+      return sendError(res, 'Transaction has already been rejected', 400, 'InvalidTransactionState');
+    }
+
+    const rejectedRecord = await prisma.transaction.update({
+      where: { id },
+      data: {
         settlementStatus: 'REJECTED',
-        rejectedBy,
-        rejectionReason,
-        rejectedAt: new Date().toISOString(),
-      };
+        rejectionReason: rejectionReason || 'Rejected by human operator',
+      },
+      include: {
+        buyerBusiness: true,
+        sellerBusiness: true,
+        offer: {
+          include: {
+            product: true,
+            sellerAgent: true,
+            sellerBusiness: true,
+          },
+        },
+        negotiation: {
+          include: {
+            targetProduct: true,
+            buyerBusiness: true,
+            buyerAgent: true,
+          },
+        },
+      },
+    });
+
+    // Release inventory if offer exists
+    if (existingTx.offer?.product?.inventory) {
+      await prisma.inventory.update({
+        where: { id: existingTx.offer.product.inventory.id },
+        data: {
+          reservedQuantity: Math.max(0, existingTx.offer.product.inventory.reservedQuantity - existingTx.offer.quantity),
+        },
+      });
+    }
+
+    // Update Negotiation status to REJECTED
+    if (existingTx.negotiationId) {
+      try {
+        await prisma.negotiation.update({
+          where: { id: existingTx.negotiationId },
+          data: { status: 'REJECTED' },
+        });
+      } catch {}
+    }
+
+    // Update Offer status to REJECTED
+    if (existingTx.offerId) {
+      try {
+        await prisma.offer.update({
+          where: { id: existingTx.offerId },
+          data: { status: 'REJECTED', rejectionReason: rejectionReason || 'Rejected by human operator' },
+        });
+      } catch {}
+    }
+
+    await prisma.auditLog.create({
+      data: {
+        entityType: 'TRANSACTION',
+        entityId: id,
+        action: 'REJECTED',
+        actorType: 'HUMAN',
+        actorId: rejectedBy || 'operator',
+        previousState: { status: existingTx.settlementStatus },
+        newState: { status: 'REJECTED', reason: rejectionReason },
+      },
+    });
+
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('transaction:rejected', rejectedRecord);
     }
 
     return sendSuccess(res, rejectedRecord, 'Transaction rejected by human operator');
@@ -237,7 +355,6 @@ export async function rejectTransaction(req, res, next) {
   }
 }
 
-
 export async function createTransaction(req, res, next) {
   try {
     const { negotiationId, offerId } = req.body;
@@ -245,76 +362,166 @@ export async function createTransaction(req, res, next) {
       return sendError(res, 'Either negotiationId or offerId is required', 400, 'ValidationError');
     }
 
-    // Check if an existing transaction already exists
-    let existingTx = null;
-    try {
-      existingTx = await prisma.transaction.findFirst({
-        where: offerId ? { offerId } : { negotiationId },
+    let targetOffer = null;
+
+    if (offerId) {
+      targetOffer = await prisma.offer.findUnique({
+        where: { id: offerId },
         include: {
-          buyerBusiness: { select: { name: true } },
-          sellerBusiness: { select: { name: true } },
-          offer: true,
+          product: true,
+          sellerBusiness: true,
+          sellerAgent: true,
+          negotiation: {
+            include: {
+              targetProduct: true,
+              buyerBusiness: true,
+              buyerAgent: true,
+            },
+          },
         },
       });
-    } catch {}
+      if (!targetOffer) {
+        return sendError(res, `Offer ${offerId} not found`, 404, 'OfferNotFound');
+      }
+    } else if (negotiationId) {
+      // Find the winning/recommended offer or highest utility offer from the latest round
+      targetOffer = await prisma.offer.findFirst({
+        where: { negotiationId, isRecommended: true },
+        orderBy: { roundNumber: 'desc' },
+        include: {
+          product: true,
+          sellerBusiness: true,
+          sellerAgent: true,
+          negotiation: {
+            include: {
+              targetProduct: true,
+              buyerBusiness: true,
+              buyerAgent: true,
+            },
+          },
+        },
+      });
+
+      if (!targetOffer) {
+        targetOffer = await prisma.offer.findFirst({
+          where: { negotiationId },
+          orderBy: [{ roundNumber: 'desc' }, { utilityScore: 'desc' }],
+          include: {
+            product: true,
+            sellerBusiness: true,
+            sellerAgent: true,
+            negotiation: {
+              include: {
+                targetProduct: true,
+                buyerBusiness: true,
+                buyerAgent: true,
+              },
+            },
+          },
+        });
+      }
+
+      if (!targetOffer) {
+        return sendError(res, `No offers found for negotiation ${negotiationId}`, 404, 'OfferNotFound');
+      }
+    }
+
+    // Check if a transaction ALREADY exists for this exact offerId
+    let existingTx = await prisma.transaction.findUnique({
+      where: { offerId: targetOffer.id },
+      include: {
+        buyerBusiness: true,
+        sellerBusiness: true,
+        offer: {
+          include: {
+            product: true,
+            sellerAgent: true,
+            sellerBusiness: true,
+          },
+        },
+        negotiation: {
+          include: {
+            targetProduct: true,
+            buyerBusiness: true,
+            buyerAgent: true,
+          },
+        },
+        approvedBy: { select: { id: true, name: true, role: true } },
+      },
+    });
 
     if (existingTx) {
-      return sendSuccess(res, existingTx, 'Existing transaction retrieved', 200);
+      return sendSuccess(res, existingTx, 'Existing transaction retrieved for selected offer', 200);
     }
 
-    // Find recommended or best offer
-    let targetOffer = null;
-    try {
-      if (offerId) {
-        targetOffer = await prisma.offer.findUnique({
-          where: { id: offerId },
-          include: { sellerBusiness: true },
-        });
-      } else {
-        targetOffer = await prisma.offer.findFirst({
-          where: { negotiationId, isRecommended: true },
-          include: { sellerBusiness: true },
-        });
-        if (!targetOffer) {
-          targetOffer = await prisma.offer.findFirst({
-            where: { negotiationId },
-            orderBy: { utilityScore: 'desc' },
-            include: { sellerBusiness: true },
-          });
-        }
-      }
-    } catch {}
+    const negotiation = targetOffer.negotiation;
+    const buyerBusinessId = negotiation?.buyerBusinessId || targetOffer.sellerBusinessId;
+    const sellerBusinessId = targetOffer.sellerBusinessId;
+    const settlementAmount = targetOffer.totalPrice;
 
-    if (!targetOffer) {
-      return sendError(res, 'No eligible offer found to generate a transaction', 404, 'OfferNotFound');
-    }
-
-    let negotiation = null;
-    try {
-      negotiation = await prisma.negotiation.findUnique({
-        where: { id: targetOffer.negotiationId },
-      });
-    } catch {}
+    // Build realistic seller VPA from seller details
+    const sellerCleanName = (targetOffer.sellerBusiness?.name || 'supplier').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const destinationVpa = targetOffer.sellerBusiness?.contactEmail || `${sellerCleanName}@icici`;
 
     const newTx = await prisma.transaction.create({
       data: {
         negotiationId: targetOffer.negotiationId,
         offerId: targetOffer.id,
-        buyerBusinessId: negotiation?.buyerBusinessId || targetOffer.sellerBusinessId,
-        sellerBusinessId: targetOffer.sellerBusinessId,
-        settlementAmount: targetOffer.totalPrice,
+        buyerBusinessId,
+        sellerBusinessId,
+        settlementAmount,
         currency: 'INR',
-        paymentMethod: 'MOCK_UPI',
+        paymentMethod: targetOffer.paymentTerms || 'MOCK_UPI',
         settlementStatus: 'PENDING_APPROVAL',
         humanApprovalRequired: true,
-        mockUpiVpa: 'prismwholesale@icici',
+        mockUpiVpa: destinationVpa,
       },
       include: {
-        buyerBusiness: { select: { name: true } },
-        sellerBusiness: { select: { name: true } },
-        offer: true,
+        buyerBusiness: true,
+        sellerBusiness: true,
+        offer: {
+          include: {
+            product: true,
+            sellerAgent: true,
+            sellerBusiness: true,
+          },
+        },
+        negotiation: {
+          include: {
+            targetProduct: true,
+            buyerBusiness: true,
+            buyerAgent: true,
+          },
+        },
       },
     });
+
+    // Write audit log
+    try {
+      await prisma.auditLog.create({
+        data: {
+          entityType: 'TRANSACTION',
+          entityId: newTx.id,
+          action: 'CREATED',
+          actorType: 'SYSTEM',
+          actorId: targetOffer.sellerAgentId || 'system-orchestrator',
+          newState: {
+            transactionId: newTx.id,
+            negotiationId: newTx.negotiationId,
+            offerId: newTx.offerId,
+            settlementAmount: Number(newTx.settlementAmount),
+            settlementStatus: newTx.settlementStatus,
+          },
+          metadata: {
+            sellerBusinessId: newTx.sellerBusinessId,
+            buyerBusinessId: newTx.buyerBusinessId,
+            offerTotalPrice: Number(targetOffer.totalPrice),
+          },
+        },
+      });
+    } catch (auditErr) {
+      console.warn('AuditLog creation notice:', auditErr?.message);
+    }
 
     const io = req.app.get('io');
     if (io) {

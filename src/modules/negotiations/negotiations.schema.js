@@ -3,8 +3,8 @@ import { z } from 'zod';
 export const createNegotiationSchema = z.object({
   targetProductId: z.string().min(1, 'Target Product ID is required'),
   targetQuantity: z.number().int().positive().max(10000),
-  maxBudget: z.number().positive().max(50000, 'Max budget cannot exceed ₹50,000 constraint'),
-  maxDeliveryHours: z.number().int().min(12).max(48, 'Max delivery deadline cannot exceed 48 hours constraint'),
+  maxBudget: z.number().positive(),
+  maxDeliveryHours: z.number().int().min(1).max(168).default(48),
   targetResaleMargin: z.number().min(5).max(80).default(25.00),
 });
 
