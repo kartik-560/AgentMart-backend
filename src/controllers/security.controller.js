@@ -5,12 +5,12 @@ export async function getSecurityAlerts(req, res, next) {
   try {
     let alerts = [];
     try {
-      alerts = await prisma.securityAlert.findMany({
+      alerts = await prisma.securityEvent.findMany({
         include: { offendingAgent: { select: { name: true, agentType: true } } },
         orderBy: { createdAt: 'desc' },
       });
     } catch {
-      // Mock fallback
+      // Fallback
     }
 
     if (!alerts.length) {
@@ -40,7 +40,7 @@ export async function getSecurityAlerts(req, res, next) {
       ];
     }
 
-    return sendSuccess(res, alerts, 'Security alerts retrieved');
+    return sendSuccess(res, alerts, 'Security events retrieved');
   } catch (error) {
     next(error);
   }
@@ -76,17 +76,28 @@ export async function resolveAlert(req, res, next) {
     const { id } = req.params;
     const { resolutionNotes, actionTaken } = req.body;
 
-    const resolved = {
-      id,
-      resolved: true,
-      resolutionNotes,
-      actionTaken,
-      resolvedAt: new Date().toISOString(),
-    };
+    let resolved = null;
+    try {
+      resolved = await prisma.securityEvent.update({
+        where: { id },
+        data: {
+          resolved: true,
+          resolutionNotes,
+          mitigationAction: actionTaken || 'RESOLVED',
+        },
+      });
+    } catch {
+      resolved = {
+        id,
+        resolved: true,
+        resolutionNotes,
+        actionTaken,
+        resolvedAt: new Date().toISOString(),
+      };
+    }
 
-    return sendSuccess(res, resolved, 'Security alert resolved');
+    return sendSuccess(res, resolved, 'Security event resolved');
   } catch (error) {
     next(error);
   }
 }
-

@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import authRoutes from './auth.routes.js';
 import healthRoutes from './health.routes.js';
 import businessRoutes from './business.routes.js';
 import productsRoutes from './products.routes.js';
@@ -10,6 +11,7 @@ import auditRoutes from './audit.routes.js';
 
 const apiRouter = Router();
 
+apiRouter.use('/auth', authRoutes);
 apiRouter.use('/health', healthRoutes);
 apiRouter.use('/business', businessRoutes);
 apiRouter.use('/products', productsRoutes);
@@ -20,4 +22,3 @@ apiRouter.use('/security', securityRoutes);
 apiRouter.use('/audit', auditRoutes);
 
 export default apiRouter;
-
