@@ -18,22 +18,7 @@ export async function getNegotiations(req, res, next) {
       // Fallback
     }
 
-    if (!negotiations.length) {
-      negotiations = [
-        {
-          id: 'neg-demo-001',
-          title: 'Procurement: 12x Enterprise Wi-Fi 6 Mesh Router',
-          targetProduct: { sku: 'ELEC-RT-001', name: 'Enterprise Wi-Fi 6 Mesh Router', category: 'Electronics' },
-          targetQuantity: 12,
-          maxBudget: 50000.00,
-          maxDeliveryHours: 48,
-          currentRound: 2,
-          status: 'PENDING_HUMAN_APPROVAL',
-          recommendedOfferId: 'off-demo-a',
-          createdAt: new Date().toISOString(),
-        },
-      ];
-    }
+
 
     return sendSuccess(res, negotiations, 'Negotiations retrieved');
   } catch (error) {

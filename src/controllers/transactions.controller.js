@@ -20,42 +20,7 @@ export async function getTransactions(req, res, next) {
       // Fallback
     }
 
-    if (!transactions.length) {
-      transactions = [
-        {
-          id: 'tx-demo-001',
-          negotiationId: 'neg-demo-001',
-          offerId: 'off-demo-a',
-          buyerBusiness: { name: 'Apex Retail Enterprises' },
-          sellerBusiness: { name: 'Prism Wholesale Direct' },
-          settlementAmount: 44400.00,
-          currency: 'INR',
-          paymentMethod: 'MOCK_UPI',
-          settlementStatus: 'PENDING_APPROVAL',
-          humanApprovalRequired: true,
-          mockUpiVpa: 'prismwholesale@icici',
-          createdAt: new Date().toISOString(),
-        },
-        {
-          id: 'tx-demo-000',
-          negotiationId: 'neg-past-000',
-          offerId: 'off-past-b',
-          buyerBusiness: { name: 'Apex Retail Enterprises' },
-          sellerBusiness: { name: 'SwiftQuality Logistics' },
-          settlementAmount: 38200.00,
-          currency: 'INR',
-          paymentMethod: 'MOCK_UPI',
-          settlementStatus: 'SETTLED',
-          humanApprovalRequired: true,
-          approverSignature: 'Kartik - Senior Procurement Director',
-          approvedAt: new Date(Date.now() - 86400000).toISOString(),
-          mockUpiReference: 'UPI-SETTLED-892104',
-          mockUpiVpa: 'swiftquality@hdfc',
-          settledAt: new Date(Date.now() - 86350000).toISOString(),
-          createdAt: new Date(Date.now() - 90000000).toISOString(),
-        },
-      ];
-    }
+
 
     return sendSuccess(res, transactions, 'Transactions retrieved');
   } catch (error) {
