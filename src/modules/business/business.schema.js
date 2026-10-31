@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+export * from '../../agent-engine/memory/memory.schema.js';
+
 export const updateBusinessProfileSchema = z.object({
   name: z.string().min(2).optional(),
   contactEmail: z.string().email().optional(),
@@ -10,3 +12,8 @@ export const updateBusinessProfileSchema = z.object({
   riskTolerance: z.enum(['CONSERVATIVE', 'BALANCED', 'AGGRESSIVE']).optional(),
 });
 
+export const applyPolicyRecommendationSchema = z.object({
+  recommendationId: z.string().min(1),
+  approvedBy: z.string().min(2),
+  notes: z.string().optional(),
+});

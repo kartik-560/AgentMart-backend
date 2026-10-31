@@ -1,93 +1,73 @@
 /**
  * Deterministic Decision Engine
- * Computes multi-attribute utility scores for competing supplier offers.
- * Normalizes price, delivery SLA, quality grade, and supplier historical reliability.
+ * Unifies the Buyer Decision Engine and Seller Decision Engine.
+ * 
+ * Computes multi-attribute utility scores for competing supplier offers,
+ * validates hard business constraints, assesses risk, compares offers side-by-side,
+ * and evaluates buyer RFQs for sellers with accept, reject, or counteroffer recommendations.
  */
 
-export class DecisionEngine {
-  static WEIGHTS = {
-    price: 0.40,
-    delivery: 0.25,
-    quality: 0.20,
-    reliability: 0.15,
-  };
+import { BuyerDecisionEngine } from './buyer.decision.engine.js';
+import { SellerDecisionEngine } from './seller.decision.engine.js';
 
-  static QUALITY_SCORES = {
-    'Enterprise-Plus': 100,
-    'Enterprise': 88,
-    'Tier-A': 80,
-    'Industrial': 75,
-    'Commercial': 65,
-    'Standard': 55,
-    'Uncertified': 10,
-  };
+export { BuyerDecisionEngine, SellerDecisionEngine };
+
+export class DecisionEngine {
+  // Expose existing constants for backward compatibility
+  static WEIGHTS = BuyerDecisionEngine.LEGACY_WEIGHTS;
+  static QUALITY_SCORES = BuyerDecisionEngine.QUALITY_SCORES;
+  static PAYMENT_SCORES = BuyerDecisionEngine.PAYMENT_SCORES;
 
   /**
-   * Evaluates a single offer and calculates its normalized utility score (0 - 100)
+   * Evaluates a single supplier offer.
+   * Backward compatible with existing callers, enhanced with hard constraint validation & risk evaluation.
+   *
+   * @param {Object} offer - Supplier offer payload
+   * @param {Object} [constraints={}] - Buyer constraints (maxBudget, maxDeliveryHours, etc.)
+   * @param {number} [supplierReliabilityScore=80] - Historical supplier reliability (0-100)
+   * @returns {Object} Utility score, breakdown, and constraint check results
    */
   static evaluateOffer(offer, constraints = {}, supplierReliabilityScore = 80) {
-    const maxBudget = Number(constraints.maxBudget || 50000);
-    const maxHours = parseInt(constraints.maxDeliveryHours || 48, 10);
-    const targetRetail = Number(constraints.targetResalePrice || offer.unitPrice * 1.3);
-
-    // 1. Price Score: Lower is better (higher savings relative to max budget)
-    let priceScore = 0;
-    if (offer.totalPrice <= maxBudget) {
-      const savingsRatio = (maxBudget - offer.totalPrice) / maxBudget;
-      priceScore = Math.min(100, Math.max(0, 75 + (savingsRatio * 150)));
-    } else {
-      priceScore = 0; // Breach
-    }
-
-    // 2. Delivery Score: Faster is better
-    let deliveryScore = 0;
-    if (offer.deliveryHours <= maxHours) {
-      const speedRatio = (maxHours - offer.deliveryHours) / maxHours;
-      deliveryScore = Math.min(100, Math.max(0, 70 + (speedRatio * 100)));
-    } else {
-      deliveryScore = 0;
-    }
-
-    // 3. Quality Score
-    const qualityScore = this.QUALITY_SCORES[offer.qualityGrade] || 50;
-
-    // 4. Historical Reliability Score (from Business Memory)
-    const reliabilityScore = Math.min(100, Math.max(0, supplierReliabilityScore));
-
-    // Weighted Utility Aggregate
-    const rawUtility = (
-      (priceScore * this.WEIGHTS.price) +
-      (deliveryScore * this.WEIGHTS.delivery) +
-      (qualityScore * this.WEIGHTS.quality) +
-      (reliabilityScore * this.WEIGHTS.reliability)
-    );
-
-    // If hidden fee detected, penalize utility heavily
-    const finalUtility = offer.hiddenFeeDetected ? Math.max(0, rawUtility - 50) : rawUtility;
-    const roundedUtility = Math.round(finalUtility * 10) / 10;
-
-    return {
-      utilityScore: roundedUtility,
-      breakdown: {
-        priceScore: Math.round(priceScore * 10) / 10,
-        deliveryScore: Math.round(deliveryScore * 10) / 10,
-        qualityScore,
-        reliabilityScore,
-        penaltyApplied: offer.hiddenFeeDetected ? 50 : 0,
-      },
-    };
+    return BuyerDecisionEngine.evaluateOffer(offer, constraints, supplierReliabilityScore, { legacyWeights: true });
   }
 
   /**
-   * Compares and ranks all offers in a negotiation round
+   * Evaluates an offer using the full 6-attribute Buyer Decision Engine
+   */
+  static evaluateBuyerOffer(offer, constraints = {}, supplierReliabilityScore = 80, options = {}) {
+    return BuyerDecisionEngine.evaluateOffer(offer, constraints, supplierReliabilityScore, options);
+  }
+
+  /**
+   * Compares and ranks all offers in a negotiation round side-by-side
    */
   static rankOffers(offersWithScores) {
-    return [...offersWithScores].sort((a, b) => {
-      // Discard flagged or invalid offers to the bottom
-      if (a.hiddenFeeDetected && !b.hiddenFeeDetected) return 1;
-      if (!a.hiddenFeeDetected && b.hiddenFeeDetected) return -1;
-      return (b.utilityScore || 0) - (a.utilityScore || 0);
-    });
+    return BuyerDecisionEngine.rankOffers(offersWithScores);
+  }
+
+  /**
+   * Generates a side-by-side comparison matrix with recommended deal selection
+   */
+  static compareOffers(offers, constraints = {}, reliabilityMap = {}) {
+    return BuyerDecisionEngine.compareOffers(offers, constraints, reliabilityMap);
+  }
+
+  /**
+   * Evaluates a buyer purchase request from the seller's perspective
+   *
+   * @param {Object} rfq - Buyer RFQ / counter-proposal
+   * @param {Object} productContext - Product cost, floor price, stock, lead time
+   * @param {Object} [options={}] - Seller strategy parameters
+   * @returns {Object} Evaluation with ACCEPT, REJECT, or COUNTEROFFER recommendation
+   */
+  static evaluateSellerRequest(rfq, productContext, options = {}) {
+    return SellerDecisionEngine.evaluateBuyerRequest(rfq, productContext, options);
+  }
+
+  /**
+   * Generates a concrete counteroffer proposal payload for sellers
+   */
+  static generateSellerRecommendation(rfq, productContext, options = {}) {
+    return SellerDecisionEngine.generateCounteroffer(rfq, productContext, options);
   }
 }
-
