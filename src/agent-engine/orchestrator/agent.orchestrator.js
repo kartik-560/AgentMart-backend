@@ -165,13 +165,13 @@ export class AgentOrchestrator {
         proposal: {
           sku: product.sku,
           quantity,
-          unitPrice: Number(quote.proposal.unitPrice),
-          declaredFees: Number(quote.proposal.declaredFees || 0),
-          totalPrice: Number(quote.proposal.totalPrice),
-          deliveryLeadTimeHours: Number(quote.proposal.deliveryLeadTimeHours || quote.proposal.deliveryHours || 48),
+          unitPrice: Number(String(quote.proposal.unitPrice || 0).replace(/[^0-9.-]+/g, "")) || 100,
+          declaredFees: Number(String(quote.proposal.declaredFees || 0).replace(/[^0-9.-]+/g, "")) || 0,
+          totalPrice: Number(String(quote.proposal.totalPrice || 0).replace(/[^0-9.-]+/g, "")) || 100,
+          deliveryLeadTimeHours: Number(String(quote.proposal.deliveryLeadTimeHours || quote.proposal.deliveryHours || 48).replace(/[^0-9.-]+/g, "")) || 48,
           qualityGrade: quote.proposal.qualityGrade || 'Standard',
           paymentMethodRequested: quote.proposal.paymentMethodRequested || 'MOCK_UPI',
-          warrantyMonths: Number(quote.proposal.warrantyMonths || 12),
+          warrantyMonths: Number(String(quote.proposal.warrantyMonths || 12).replace(/[^0-9.-]+/g, "")) || 12,
           notes: quote.proposal.notes || '',
         },
         securityValidation: {

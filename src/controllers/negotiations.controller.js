@@ -218,20 +218,102 @@ export async function getOffersByNegotiationId(req, res, next) {
 export async function getOfferComparison(req, res, next) {
   try {
     const { id } = req.params;
-    const comparison = {
+    let negotiation = null;
+    let offers = [];
+
+    try {
+      negotiation = await prisma.negotiation.findUnique({
+        where: { id },
+        include: { targetProduct: true },
+      });
+      offers = await prisma.offer.findMany({
+        where: { negotiationId: id },
+        include: {
+          sellerAgent: { select: { id: true, name: true, agentType: true } },
+          sellerBusiness: { select: { id: true, name: true } },
+        },
+        orderBy: [{ roundNumber: 'desc' }, { utilityScore: 'desc' }],
+      });
+    } catch (e) {
+      // fallback
+    }
+
+    if (negotiation && offers.length > 0) {
+      const latestRound = offers[0].roundNumber;
+      const latestOffers = offers.filter((o) => o.roundNumber === latestRound);
+      const maxBudget = Number(negotiation.maxBudget || 50000);
+      const maxDelivery = negotiation.maxDeliveryHours || 48;
+
+      const formattedOffers = latestOffers.map((o) => {
+        const totalPrice = Number(o.totalPrice);
+        const deliveryHours = o.deliveryHours;
+        const withinBudget = totalPrice <= maxBudget;
+        const withinSla = deliveryHours <= maxDelivery;
+
+        return {
+          id: o.id,
+          agentId: o.sellerAgent?.id || o.sellerAgentId,
+          sellerName: o.sellerAgent?.name || 'Seller Agent',
+          name: o.sellerAgent?.name || 'Seller Agent',
+          businessName: o.sellerBusiness?.name || 'Supplier Partner',
+          strategy: o.sellerAgent?.agentType === 'SELLER_A_PRICE' ? 'Low Margin / Price Priority' : (o.sellerAgent?.agentType === 'SELLER_B_SPEED_QUALITY' ? 'Speed & Premium Quality Priority' : 'Adversarial Simulation'),
+          unitPrice: Number(o.unitPrice),
+          quantity: o.quantity,
+          totalPrice,
+          deliveryHours,
+          qualityGrade: o.qualityGrade,
+          resaleMarginProjected: Number(o.resaleMarginProjected || 20),
+          utilityScore: o.utilityScore || 0,
+          withinBudget,
+          withinSla,
+          securityStatus: o.hiddenFeeDetected ? 'FLAGGED_HIDDEN_FEE' : 'CLEAN',
+          isRecommended: o.isRecommended,
+          flagReason: o.hiddenFeeDetected ? 'Hidden fee or abnormal price variance detected' : null,
+        };
+      });
+
+      const recommended = formattedOffers.find((o) => o.isRecommended) || formattedOffers[0];
+      const budgetSaved = maxBudget - (recommended ? recommended.totalPrice : 0);
+
+      const comparison = {
+        negotiationId: id,
+        roundNumber: latestRound,
+        constraints: {
+          maxBudget,
+          maxDeliveryHours: maxDelivery,
+          minMargin: Number(negotiation.targetResaleMargin || 25),
+        },
+        offers: formattedOffers,
+        recommendationSummary: recommended
+          ? {
+              winnerAgentId: recommended.agentId,
+              sellerName: recommended.sellerName,
+              recommendedPrice: recommended.totalPrice,
+              budgetSaved: budgetSaved > 0 ? budgetSaved : 0,
+              reasoning: `${recommended.sellerName} satisfies all constraints with utility score ${recommended.utilityScore} and projected resale margin ${recommended.resaleMarginProjected}%.`,
+            }
+          : null,
+      };
+
+      return sendSuccess(res, comparison, 'Offer comparison matrix generated from database');
+    }
+
+    // Default fallback if no offers exist in DB
+    const fallback = {
       negotiationId: id,
       constraints: { maxBudget: 50000, maxDeliveryHours: 48, minMargin: 18 },
       offers: [
         {
           agentId: 'seller-a-price',
           name: 'Prism PriceBot (Agent A)',
+          sellerName: 'Prism PriceBot (Agent A)',
           strategy: 'Low Margin / Price Priority',
-          unitPrice: 3700.00,
+          unitPrice: 3700.0,
           quantity: 12,
-          totalPrice: 44400.00,
+          totalPrice: 44400.0,
           deliveryHours: 40,
           qualityGrade: 'Enterprise',
-          resaleMarginProjected: 24.50,
+          resaleMarginProjected: 24.5,
           utilityScore: 88.5,
           withinBudget: true,
           withinSla: true,
@@ -241,13 +323,14 @@ export async function getOfferComparison(req, res, next) {
         {
           agentId: 'seller-b-speed-quality',
           name: 'Swift CourierBot (Agent B)',
+          sellerName: 'Swift CourierBot (Agent B)',
           strategy: 'Speed & Premium Quality Priority',
-          unitPrice: 3950.00,
+          unitPrice: 3950.0,
           quantity: 12,
-          totalPrice: 47400.00,
+          totalPrice: 47400.0,
           deliveryHours: 20,
           qualityGrade: 'Enterprise-Plus',
-          resaleMarginProjected: 21.00,
+          resaleMarginProjected: 21.0,
           utilityScore: 85.0,
           withinBudget: true,
           withinSla: true,
@@ -257,13 +340,14 @@ export async function getOfferComparison(req, res, next) {
         {
           agentId: 'seller-c-malicious',
           name: 'ShadowBot (Agent C - Malicious)',
+          sellerName: 'ShadowBot (Agent C - Malicious)',
           strategy: 'Adversarial Simulation',
-          unitPrice: 3200.00,
+          unitPrice: 3200.0,
           quantity: 12,
-          totalPrice: 50400.00,
+          totalPrice: 50400.0,
           deliveryHours: 12,
           qualityGrade: 'Uncertified',
-          resaleMarginProjected: 5.00,
+          resaleMarginProjected: 5.0,
           utilityScore: 22.0,
           withinBudget: false,
           withinSla: true,
@@ -274,13 +358,13 @@ export async function getOfferComparison(req, res, next) {
       ],
       recommendationSummary: {
         winnerAgentId: 'seller-a-price',
-        recommendedPrice: 44400.00,
-        budgetSaved: 5600.00,
+        recommendedPrice: 44400.0,
+        budgetSaved: 5600.0,
         reasoning: 'Seller A satisfies all constraints with the highest combined utility score (88.5) and delivers a 24.5% projected resale margin.',
       },
     };
 
-    return sendSuccess(res, comparison, 'Offer comparison matrix generated');
+    return sendSuccess(res, fallback, 'Offer comparison matrix generated');
   } catch (error) {
     next(error);
   }

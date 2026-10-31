@@ -4,39 +4,30 @@ import { sendSuccess, sendError } from '../utils/response.js';
 export async function getProducts(req, res, next) {
   try {
     const { category, search, limit = 50, offset = 0 } = req.query;
-    let products = [];
-    let total = 0;
-
-    try {
-      const where = {};
-      if (category) where.category = category;
-      if (search) {
-        where.OR = [
-          { name: { contains: search, mode: 'insensitive' } },
-          { sku: { contains: search, mode: 'insensitive' } },
-        ];
-      }
-
-      [products, total] = await Promise.all([
-        prisma.product.findMany({
-          where,
-          include: { inventory: true },
-          take: limit,
-          skip: offset,
-          orderBy: { sku: 'asc' },
-        }),
-        prisma.product.count({ where }),
-      ]);
-    } catch {
-      // Fallback
+    const where = {};
+    if (category && category !== 'ALL') where.category = category;
+    if (search) {
+      where.OR = [
+        { name: { contains: search, mode: 'insensitive' } },
+        { sku: { contains: search, mode: 'insensitive' } },
+      ];
     }
 
-    if (!products.length) {
-      products = generateMockCatalog(limit);
-      total = 40;
-    }
+    const takeCount = parseInt(limit, 10) || 50;
+    const skipCount = parseInt(offset, 10) || 0;
 
-    return sendSuccess(res, { products, total, limit, offset }, 'Products retrieved');
+    const [products, total] = await Promise.all([
+      prisma.product.findMany({
+        where,
+        include: { inventory: true },
+        take: takeCount,
+        skip: skipCount,
+        orderBy: { sku: 'asc' },
+      }),
+      prisma.product.count({ where }),
+    ]);
+
+    return sendSuccess(res, { products, total, limit: takeCount, offset: skipCount }, 'Products retrieved from database');
   } catch (error) {
     next(error);
   }
@@ -45,39 +36,19 @@ export async function getProducts(req, res, next) {
 export async function getProductById(req, res, next) {
   try {
     const { id } = req.params;
-    let product = null;
-
-    try {
-      product = await prisma.product.findUnique({
-        where: { id },
-        include: { inventory: true, business: { select: { name: true, businessType: true } } },
-      });
-    } catch {
-      // Fallback
-    }
+    const product = await prisma.product.findUnique({
+      where: { id },
+      include: {
+        inventory: true,
+        business: { select: { id: true, name: true, businessType: true, contactEmail: true } },
+      },
+    });
 
     if (!product) {
-      product = {
-        id,
-        sku: 'ELEC-RT-001',
-        name: 'Enterprise Wi-Fi 6 Mesh Router',
-        category: 'Electronics',
-        unit: 'Unit',
-        baseCostPrice: 3200,
-        minSellingPrice: 3500,
-        targetSellingPrice: 4200,
-        qualityGrade: 'Enterprise',
-        typicalLeadTimeHours: 24,
-        inventory: {
-          stockQuantity: 120,
-          reservedQuantity: 12,
-          warehouseLocation: 'Warehouse Zone A - Mumbai Central',
-          minThreshold: 15,
-        },
-      };
+      return sendError(res, `Product with ID [${id}] not found in database`, 404, 'NotFound');
     }
 
-    return sendSuccess(res, product, 'Product details retrieved');
+    return sendSuccess(res, product, 'Product details retrieved from database');
   } catch (error) {
     next(error);
   }
@@ -88,55 +59,23 @@ export async function updateInventory(req, res, next) {
     const { id } = req.params;
     const { stockQuantity, reservedQuantity, warehouseLocation } = req.body;
 
-    let updatedInventory = null;
-    try {
-      updatedInventory = await prisma.inventory.upsert({
-        where: { productId: id },
-        update: {
-          ...(stockQuantity !== undefined && { stockQuantity }),
-          ...(reservedQuantity !== undefined && { reservedQuantity }),
-          ...(warehouseLocation && { warehouseLocation }),
-        },
-        create: {
-          productId: id,
-          stockQuantity: stockQuantity || 100,
-          reservedQuantity: reservedQuantity || 0,
-          warehouseLocation: warehouseLocation || 'Main Hub - Mumbai',
-        },
-      });
-    } catch {
-      updatedInventory = { productId: id, stockQuantity, reservedQuantity, warehouseLocation };
-    }
+    const updatedInventory = await prisma.inventory.upsert({
+      where: { productId: id },
+      update: {
+        ...(stockQuantity !== undefined && { stockQuantity: parseInt(stockQuantity, 10) }),
+        ...(reservedQuantity !== undefined && { reservedQuantity: parseInt(reservedQuantity, 10) }),
+        ...(warehouseLocation && { warehouseLocation }),
+      },
+      create: {
+        productId: id,
+        stockQuantity: parseInt(stockQuantity, 10) || 100,
+        reservedQuantity: parseInt(reservedQuantity, 10) || 0,
+        warehouseLocation: warehouseLocation || 'Main Hub - Mumbai',
+      },
+    });
 
-    return sendSuccess(res, updatedInventory, 'Product inventory updated successfully');
+    return sendSuccess(res, updatedInventory, 'Product inventory updated in database');
   } catch (error) {
     next(error);
   }
-}
-
-function generateMockCatalog(limit = 40) {
-  const categories = ['Electronics', 'Warehouse', 'Safety', 'Office', 'Retail-POS'];
-  const catalog = [];
-  for (let i = 1; i <= Math.min(40, limit); i++) {
-    const cat = categories[i % categories.length];
-    catalog.push({
-      id: `prod-mock-${i}`,
-      sku: `SKU-${cat.substring(0, 3).toUpperCase()}-${String(i).padStart(3, '0')}`,
-      name: `Commercial B2B ${cat} Item #${i}`,
-      category: cat,
-      unit: 'Unit',
-      baseCostPrice: 1000 + i * 150,
-      minSellingPrice: 1200 + i * 150,
-      targetSellingPrice: 1500 + i * 180,
-      qualityGrade: i % 2 === 0 ? 'Enterprise' : 'Industrial',
-      typicalLeadTimeHours: (i % 3 + 1) * 12,
-      inventory: {
-        stockQuantity: 100 + i * 10,
-        reservedQuantity: 0,
-        warehouseLocation: 'Warehouse Zone A - Mumbai Central',
-        minThreshold: 15,
-      },
-    });
-  }
-  return catalog;
 }

@@ -2,6 +2,15 @@ import { geminiClient } from '../../config/gemini.js';
 import { logger } from '../../utils/logger.js';
 import { LLMSellerProposalSchema, LLMBuyerEvaluationSchema } from '../schemas/llm.schemas.js';
 
+function cleanNum(v) {
+  if (typeof v === 'number') return isNaN(v) ? undefined : v;
+  if (typeof v === 'string') {
+    const cleaned = parseFloat(v.replace(/[^\d.-]/g, ''));
+    return isNaN(cleaned) ? undefined : cleaned;
+  }
+  return undefined;
+}
+
 /**
  * Base Agent
  * Abstract base class for all autonomous marketplace agents.
@@ -100,12 +109,20 @@ export class BaseAgent {
       if (match) {
         const rawJson = (match[1] || match[0]).trim();
         const parsed = JSON.parse(rawJson);
+
+        if (parsed.unitPrice !== undefined) parsed.unitPrice = cleanNum(parsed.unitPrice);
+        if (parsed.totalPrice !== undefined) parsed.totalPrice = cleanNum(parsed.totalPrice);
+        if (parsed.quantity !== undefined) parsed.quantity = cleanNum(parsed.quantity);
+        if (parsed.declaredFees !== undefined) parsed.declaredFees = cleanNum(parsed.declaredFees);
+        if (parsed.deliveryLeadTimeHours !== undefined) parsed.deliveryLeadTimeHours = cleanNum(parsed.deliveryLeadTimeHours);
+        if (parsed.deliveryHours !== undefined) parsed.deliveryHours = cleanNum(parsed.deliveryHours);
+
         const validated = LLMSellerProposalSchema.safeParse(parsed);
         if (validated.success) {
           return validated.data;
         }
         logger.debug(`Seller proposal Zod validation issues for [${this.name}]:`, validated.error.format());
-        return parsed; // Fallback to raw parsed if minor field deviation
+        return parsed;
       }
     } catch (e) {
       logger.debug(`Failed to parse proposal JSON from [${this.name}]: ${e.message}`);
