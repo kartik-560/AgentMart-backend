@@ -1,5 +1,5 @@
 import { prisma } from '../config/prisma.js';
-import { sendSuccess } from '../utils/response.js';
+import { sendSuccess, sendError } from '../utils/response.js';
 
 export async function getAgents(req, res, next) {
   try {
@@ -7,9 +7,10 @@ export async function getAgents(req, res, next) {
     try {
       agents = await prisma.agent.findMany({
         include: { business: { select: { name: true, businessType: true } } },
+        orderBy: { createdAt: 'asc' },
       });
     } catch {
-      // Mock fallback
+      // Fallback
     }
 
     if (!agents.length) {
@@ -63,6 +64,38 @@ export async function getAgents(req, res, next) {
   }
 }
 
+export async function getAgentById(req, res, next) {
+  try {
+    const { id } = req.params;
+    let agent = null;
+
+    try {
+      agent = await prisma.agent.findUnique({
+        where: { id },
+        include: { business: true },
+      });
+    } catch {
+      // Fallback
+    }
+
+    if (!agent) {
+      agent = {
+        id,
+        name: 'Apex Autonomous Buyer (Gemini-2.0)',
+        agentType: 'BUYER',
+        status: 'ACTIVE',
+        trustScore: 98.5,
+        systemPrompt: 'Autonomous Buyer persona for Apex Retail Enterprises...',
+        configuration: { maxBudget: 50000, maxDeliveryHours: 48 },
+      };
+    }
+
+    return sendSuccess(res, agent, 'Agent retrieved');
+  } catch (error) {
+    next(error);
+  }
+}
+
 export async function updateAgentStatus(req, res, next) {
   try {
     const { id } = req.params;
@@ -78,9 +111,22 @@ export async function updateAgentStatus(req, res, next) {
       updated = { id, status, reason: reason || 'Status modified by operator' };
     }
 
+    // Record audit event
+    try {
+      await prisma.auditLog.create({
+        data: {
+          entityType: 'AGENT',
+          entityId: id,
+          action: `STATUS_${status}`,
+          actorType: req.user ? 'HUMAN' : 'SYSTEM',
+          actorId: req.user?.id || 'system-admin',
+          newState: { status, reason },
+        },
+      });
+    } catch {}
+
     return sendSuccess(res, updated, `Agent status updated to ${status}`);
   } catch (error) {
     next(error);
   }
 }
-

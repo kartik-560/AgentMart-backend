@@ -10,6 +10,13 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+enum UserRole {
+  ADMIN
+  OPERATOR
+  BUYER_OFFICER
+  SUPPLIER_REP
+}
+
 enum BusinessType {
   RETAIL_ENTERPRISE
   DISTRIBUTOR
@@ -72,6 +79,22 @@ enum AuditActorType {
   SYSTEM
 }
 
+model User {
+  id                    String         @id @default(uuid())
+  email                 String         @unique
+  passwordHash          String
+  name                  String
+  role                  UserRole       @default(OPERATOR)
+  businessId            String?
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  business              Business?      @relation(fields: [businessId], references: [id], onDelete: SetNull)
+  approvedTransactions  Transaction[]  @relation("UserApprovedTransactions")
+
+  @@map("users")
+}
+
 model Business {
   id                    String         @id @default(uuid())
   name                  String
@@ -79,16 +102,11 @@ model Business {
   businessType          BusinessType
   contactEmail          String         @unique
   contactPhone          String?
-  budgetLimit           Decimal        @default(50000.00) @db.Decimal(12, 2)
-  targetResaleMargin    Decimal        @default(25.00) @db.Decimal(5, 2) // In percentage
-  maxDeliveryHours      Int            @default(48)
-  qualityTierRequirement String         @default("Tier-A")
-  riskTolerance         String         @default("BALANCED") // CONSERVATIVE, BALANCED, AGGRESSIVE
-  paymentPreferences    String[]       @default(["MOCK_UPI", "ESCROW"])
-  metadata              Json?
   createdAt             DateTime       @default(now())
   updatedAt             DateTime       @updatedAt
 
+  profile               BusinessProfile?
+  users                 User[]
   agents                Agent[]
   products              Product[]      @relation("BusinessProducts")
   buyerNegotiations     Negotiation[]  @relation("BuyerBusinessNegotiations")
@@ -100,12 +118,73 @@ model Business {
   @@map("businesses")
 }
 
+model BusinessProfile {
+  id                    String         @id @default(uuid())
+  businessId            String         @unique
+  budgetLimit           Decimal        @default(50000.00) @db.Decimal(12, 2)
+  targetResaleMargin    Decimal        @default(25.00) @db.Decimal(5, 2) // In percentage
+  minAcceptableMargin   Decimal        @default(18.00) @db.Decimal(5, 2)
+  maxDeliveryHours      Int            @default(48)
+  qualityTierRequirement String         @default("Enterprise")
+  riskTolerance         String         @default("BALANCED") // CONSERVATIVE, BALANCED, AGGRESSIVE
+  paymentPreferences    String[]       @default(["MOCK_UPI", "ESCROW"])
+  metadata              Json?
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  business              Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@map("business_profiles")
+}
+
+model Product {
+  id                    String         @id @default(uuid())
+  businessId            String
+  sku                   String         @unique
+  name                  String
+  category              String
+  description           String?        @db.Text
+  unit                  String         @default("Unit")
+  baseCostPrice         Decimal        @db.Decimal(12, 2)
+  minSellingPrice       Decimal        @db.Decimal(12, 2) // Floor price
+  targetSellingPrice    Decimal        @db.Decimal(12, 2)
+  qualityGrade          String         @default("Standard")
+  typicalLeadTimeHours  Int            @default(24)
+  isActive              Boolean        @default(true)
+  metadata              Json?
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  business              Business       @relation("BusinessProducts", fields: [businessId], references: [id], onDelete: Cascade)
+  inventory             Inventory?
+  negotiations          Negotiation[]  @relation("TargetProductNegotiations")
+  offers                Offer[]
+
+  @@map("products")
+}
+
+model Inventory {
+  id                    String         @id @default(uuid())
+  productId             String         @unique
+  stockQuantity         Int            @default(0)
+  reservedQuantity      Int            @default(0)
+  warehouseLocation     String         @default("Main Central Hub - Mumbai")
+  minThreshold          Int            @default(10)
+  restockLeadDays       Int            @default(7)
+  lastRestockedAt       DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+
+  product               Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@map("inventories")
+}
+
 model Agent {
   id                    String         @id @default(uuid())
   businessId            String
   name                  String
   agentType             AgentType
-  status                AgentStatus    @default(IDLE)
+  status                AgentStatus    @default(ACTIVE)
   modelProvider         String         @default("Google-Gemini")
   modelName             String         @default("gemini-2.0-flash")
   trustScore            Float          @default(100.0) // 0 to 100
@@ -117,36 +196,10 @@ model Agent {
   business              Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
   buyerNegotiations     Negotiation[]  @relation("BuyerAgentNegotiations")
   sellerOffers          Offer[]        @relation("SellerAgentOffers")
-  negotiationMessages   NegotiationMessage[]
-  securityAlerts        SecurityAlert[]
+  agentMessages         AgentMessage[]
+  securityEvents        SecurityEvent[]
 
   @@map("agents")
-}
-
-model Product {
-  id                    String         @id @default(uuid())
-  businessId            String
-  sku                   String         @unique
-  name                  String
-  category              String
-  description           String?        @db.Text
-  unit                  String         @default("Units")
-  baseCostPrice         Decimal        @db.Decimal(12, 2)
-  minSellingPrice       Decimal        @db.Decimal(12, 2) // Floor price
-  targetSellingPrice    Decimal        @db.Decimal(12, 2)
-  stockQuantity         Int            @default(0)
-  qualityGrade          String         @default("Standard")
-  typicalLeadTimeHours  Int            @default(24)
-  isActive              Boolean        @default(true)
-  metadata              Json?
-  createdAt             DateTime       @default(now())
-  updatedAt             DateTime       @updatedAt
-
-  business              Business       @relation("BusinessProducts", fields: [businessId], references: [id], onDelete: Cascade)
-  negotiations          Negotiation[]  @relation("TargetProductNegotiations")
-  offers                Offer[]
-
-  @@map("products")
 }
 
 model Negotiation {
@@ -156,10 +209,10 @@ model Negotiation {
   buyerBusinessId       String
   buyerAgentId          String
   status                NegotiationStatus  @default(INITIATED)
-  maxBudget             Decimal            @db.Decimal(12, 2)
-  maxDeliveryHours      Int                @default(48)
-  targetQuantity        Int                @default(100)
-  targetResaleMargin    Decimal            @default(20.00) @db.Decimal(5, 2)
+  maxBudget             Decimal            @db.Decimal(12, 2) // ₹50,000 maximum constraint
+  maxDeliveryHours      Int                @default(48) // 48-hour delivery deadline
+  targetQuantity        Int                @default(12)
+  targetResaleMargin    Decimal            @default(25.00) @db.Decimal(5, 2)
   currentRound          Int                @default(1)
   recommendedOfferId    String?            @unique
   summary               String?            @db.Text
@@ -171,19 +224,19 @@ model Negotiation {
   buyerBusiness         Business           @relation("BuyerBusinessNegotiations", fields: [buyerBusinessId], references: [id])
   buyerAgent            Agent              @relation("BuyerAgentNegotiations", fields: [buyerAgentId], references: [id])
   offers                Offer[]
-  messages              NegotiationMessage[]
-  securityAlerts        SecurityAlert[]
+  agentMessages         AgentMessage[]
+  securityEvents        SecurityEvent[]
   transactions          Transaction[]
 
   @@map("negotiations")
 }
 
-model NegotiationMessage {
+model AgentMessage {
   id                    String         @id @default(uuid())
   negotiationId         String
   agentId               String
   roundNumber           Int
-  senderRole            String         // BUYER, SELLER
+  senderRole            String         // BUYER, SELLER_A_PRICE, SELLER_B_SPEED_QUALITY, SELLER_C_MALICIOUS
   content               String         @db.Text
   structuredProposal    Json?          // Extracted structured proposal terms
   llmReasoning          String?        @db.Text
@@ -193,7 +246,7 @@ model NegotiationMessage {
   negotiation           Negotiation    @relation(fields: [negotiationId], references: [id], onDelete: Cascade)
   agent                 Agent          @relation(fields: [agentId], references: [id], onDelete: Cascade)
 
-  @@map("negotiation_messages")
+  @@map("agent_messages")
 }
 
 model Offer {
@@ -239,13 +292,16 @@ model Transaction {
   paymentMethod         String            @default("MOCK_UPI")
   settlementStatus      SettlementStatus  @default(PENDING_APPROVAL)
   humanApprovalRequired Boolean           @default(true)
-  approvedBy            String?
+  approvedById          String?
+  approvedBy            User?             @relation("UserApprovedTransactions", fields: [approvedById], references: [id])
+  approverSignature     String?           // Human name/title signature
   approvedAt            DateTime?
   approvalNotes         String?
   rejectionReason       String?
-  mockUpiReference      String?
+  mockUpiReference      String?           @unique // Unique index prevents duplicate settlements
   mockUpiVpa            String?
   settledAt             DateTime?
+  tamperProofHash       String?
   metadata              Json?
   createdAt             DateTime          @default(now())
   updatedAt             DateTime          @updatedAt
@@ -258,22 +314,23 @@ model Transaction {
   @@map("transactions")
 }
 
-model SecurityAlert {
+model SecurityEvent {
   id                    String         @id @default(uuid())
   negotiationId         String?
   offendingAgentId      String?
-  threatType            String         // PROMPT_INJECTION, PRICE_GOUGING, HIDDEN_FEE, PHANTOM_INVENTORY
+  threatType            String         // PROMPT_INJECTION, PRICE_GOUGING, HIDDEN_FEE, PHANTOM_INVENTORY, REPLAY_ATTACK
   severity              ThreatSeverity
   description           String         @db.Text
   rawPayload            String?        @db.Text
-  mitigationAction      String         // FLAGGED, REJECTED, SUSPENDED, BLOCKED
+  mitigationAction      String         // FLAGGED, REJECTED, SUSPENDED, BLOCKED, PROMPT_FILTERED
   resolved              Boolean        @default(false)
+  resolutionNotes       String?
   createdAt             DateTime       @default(now())
 
   negotiation           Negotiation?   @relation(fields: [negotiationId], references: [id], onDelete: SetNull)
   offendingAgent        Agent?         @relation(fields: [offendingAgentId], references: [id], onDelete: SetNull)
 
-  @@map("security_alerts")
+  @@map("security_events")
 }
 
 model BusinessMemory {
@@ -283,7 +340,7 @@ model BusinessMemory {
   successfulDeals       Int            @default(0)
   supplierReliability   Json           @default("{}") // Map of sellerId -> score, onTimeRate, qualityScore
   negotiationTactics    Json           @default("[]") // Past successful strategies
-  recommendedPolicies   Json           @default("[]") // Pending owner approval
+  recommendedPolicies   Json           @default("[]") // Bounded recommendations pending owner approval
   lastLearnedAt         DateTime       @default(now())
   updatedAt             DateTime       @updatedAt
 
@@ -294,9 +351,9 @@ model BusinessMemory {
 
 model AuditLog {
   id                    String         @id @default(uuid())
-  entityType            String         // NEGOTIATION, OFFER, TRANSACTION, AGENT, SECURITY
+  entityType            String         // NEGOTIATION, OFFER, TRANSACTION, AGENT, SECURITY, AUTH, BUSINESS, INVENTORY
   entityId              String
-  action                String         // CREATED, COUNTERED, RECOMMENDED, APPROVED, SETTLED, FLAGGED
+  action                String         // CREATED, COUNTERED, RECOMMENDED, APPROVED, SETTLED, FLAGGED, LOGGED_IN
   actorType             AuditActorType
   actorId               String
   previousState         Json?
@@ -309,4 +366,3 @@ model AuditLog {
   @@index([timestamp])
   @@map("audit_logs")
 }
-

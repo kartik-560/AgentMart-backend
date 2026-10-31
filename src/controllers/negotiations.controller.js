@@ -1,17 +1,6 @@
 import { prisma } from '../config/prisma.js';
 import { sendSuccess, sendError } from '../utils/response.js';
-import { NegotiationEngine } from '../agent-engine/negotiation/negotiation.engine.js';
-
-let negotiationEngineInstance = null;
-
-export function getNegotiationEngine(io = null) {
-  if (!negotiationEngineInstance) {
-    negotiationEngineInstance = new NegotiationEngine(io);
-  } else if (io) {
-    negotiationEngineInstance.setSocketIo(io);
-  }
-  return negotiationEngineInstance;
-}
+import { NegotiationService } from '../services/negotiation.service.js';
 
 export async function getNegotiations(req, res, next) {
   try {
@@ -26,7 +15,7 @@ export async function getNegotiations(req, res, next) {
         orderBy: { createdAt: 'desc' },
       });
     } catch {
-      // Mock fallback
+      // Fallback
     }
 
     if (!negotiations.length) {
@@ -63,12 +52,12 @@ export async function getNegotiationById(req, res, next) {
         include: {
           targetProduct: true,
           offers: { include: { sellerAgent: true } },
-          messages: { orderBy: { createdAt: 'asc' } },
-          securityAlerts: true,
+          agentMessages: { orderBy: { createdAt: 'asc' } },
+          securityEvents: true,
         },
       });
     } catch {
-      // Mock fallback
+      // Fallback
     }
 
     if (!negotiation) {
@@ -163,7 +152,7 @@ export async function getNegotiationById(req, res, next) {
             createdAt: new Date(Date.now() - 2000000).toISOString(),
           },
         ],
-        securityAlerts: [
+        securityEvents: [
           {
             id: 'sec-1',
             threatType: 'HIDDEN_FEE',
@@ -176,7 +165,10 @@ export async function getNegotiationById(req, res, next) {
       };
     }
 
-    return sendSuccess(res, negotiation, 'Negotiation details retrieved');
+    // Format messages alias
+    const messages = negotiation.agentMessages || negotiation.messages || [];
+
+    return sendSuccess(res, { ...negotiation, messages }, 'Negotiation details retrieved');
   } catch (error) {
     next(error);
   }
@@ -184,22 +176,9 @@ export async function getNegotiationById(req, res, next) {
 
 export async function createNegotiation(req, res, next) {
   try {
-    const { targetProductId, targetQuantity, maxBudget, maxDeliveryHours, targetResaleMargin } = req.body;
-
-    const newNeg = {
-      id: `neg-${Date.now()}`,
-      title: `Procurement: ${targetQuantity}x Units`,
-      targetProductId,
-      targetQuantity,
-      maxBudget,
-      maxDeliveryHours,
-      targetResaleMargin,
-      currentRound: 1,
-      status: 'INITIATED',
-      createdAt: new Date().toISOString(),
-    };
-
-    return sendSuccess(res, newNeg, 'Negotiation session initialized', 201);
+    const io = req.app.get('io');
+    const result = await NegotiationService.createNegotiation(req.body, req.user, io);
+    return sendSuccess(res, result, 'Negotiation session initialized', 201);
   } catch (error) {
     next(error);
   }
@@ -208,27 +187,29 @@ export async function createNegotiation(req, res, next) {
 export async function advanceNegotiationRound(req, res, next) {
   try {
     const { id } = req.params;
-    const engine = getNegotiationEngine(req.app.get('io'));
+    const { roundNumber } = req.body;
+    const io = req.app.get('io');
 
-    // Execute multi-agent round
-    const mockProduct = {
-      id: 'prod-mock-1',
-      sku: 'ELEC-RT-001',
-      name: 'Enterprise Wi-Fi 6 Mesh Router',
-      baseCostPrice: 3200,
-      minSellingPrice: 3500,
-      targetSellingPrice: 4200,
-    };
+    const result = await NegotiationService.advanceRound(id, roundNumber || 1, req.user, io);
+    return sendSuccess(res, result, `Negotiation advanced to round ${result.nextRoundNumber}`);
+  } catch (error) {
+    next(error);
+  }
+}
 
-    const roundResult = await engine.advanceRound({
-      negotiationId: id,
-      product: mockProduct,
-      quantity: 12,
-      currentRound: req.body.roundNumber || 1,
-      constraints: { maxBudget: 50000, maxDeliveryHours: 48 },
-    });
+export async function getOffersByNegotiationId(req, res, next) {
+  try {
+    const { id } = req.params;
+    let offers = [];
+    try {
+      offers = await prisma.offer.findMany({
+        where: { negotiationId: id },
+        include: { sellerAgent: { select: { name: true, agentType: true } } },
+        orderBy: { roundNumber: 'desc' },
+      });
+    } catch {}
 
-    return sendSuccess(res, roundResult, `Negotiation advanced to round ${roundResult.nextRoundNumber}`);
+    return sendSuccess(res, offers, 'Offers retrieved for negotiation');
   } catch (error) {
     next(error);
   }
@@ -279,7 +260,7 @@ export async function getOfferComparison(req, res, next) {
           strategy: 'Adversarial Simulation',
           unitPrice: 3200.00,
           quantity: 12,
-          totalPrice: 50400.00, // Breaches budget when ₹12,000 fee included
+          totalPrice: 50400.00,
           deliveryHours: 12,
           qualityGrade: 'Uncertified',
           resaleMarginProjected: 5.00,
@@ -304,4 +285,3 @@ export async function getOfferComparison(req, res, next) {
     next(error);
   }
 }
-

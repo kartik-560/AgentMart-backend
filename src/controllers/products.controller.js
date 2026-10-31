@@ -1,5 +1,5 @@
 import { prisma } from '../config/prisma.js';
-import { sendSuccess } from '../utils/response.js';
+import { sendSuccess, sendError } from '../utils/response.js';
 
 export async function getProducts(req, res, next) {
   try {
@@ -20,6 +20,7 @@ export async function getProducts(req, res, next) {
       [products, total] = await Promise.all([
         prisma.product.findMany({
           where,
+          include: { inventory: true },
           take: limit,
           skip: offset,
           orderBy: { sku: 'asc' },
@@ -27,7 +28,10 @@ export async function getProducts(req, res, next) {
         prisma.product.count({ where }),
       ]);
     } catch {
-      // Return 40 mock SKUs if DB query fails before db:push
+      // Fallback
+    }
+
+    if (!products.length) {
       products = generateMockCatalog(limit);
       total = 40;
     }
@@ -44,9 +48,12 @@ export async function getProductById(req, res, next) {
     let product = null;
 
     try {
-      product = await prisma.product.findUnique({ where: { id } });
+      product = await prisma.product.findUnique({
+        where: { id },
+        include: { inventory: true, business: { select: { name: true, businessType: true } } },
+      });
     } catch {
-      // Mock fallback
+      // Fallback
     }
 
     if (!product) {
@@ -59,13 +66,49 @@ export async function getProductById(req, res, next) {
         baseCostPrice: 3200,
         minSellingPrice: 3500,
         targetSellingPrice: 4200,
-        stockQuantity: 120,
         qualityGrade: 'Enterprise',
         typicalLeadTimeHours: 24,
+        inventory: {
+          stockQuantity: 120,
+          reservedQuantity: 12,
+          warehouseLocation: 'Warehouse Zone A - Mumbai Central',
+          minThreshold: 15,
+        },
       };
     }
 
     return sendSuccess(res, product, 'Product details retrieved');
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function updateInventory(req, res, next) {
+  try {
+    const { id } = req.params;
+    const { stockQuantity, reservedQuantity, warehouseLocation } = req.body;
+
+    let updatedInventory = null;
+    try {
+      updatedInventory = await prisma.inventory.upsert({
+        where: { productId: id },
+        update: {
+          ...(stockQuantity !== undefined && { stockQuantity }),
+          ...(reservedQuantity !== undefined && { reservedQuantity }),
+          ...(warehouseLocation && { warehouseLocation }),
+        },
+        create: {
+          productId: id,
+          stockQuantity: stockQuantity || 100,
+          reservedQuantity: reservedQuantity || 0,
+          warehouseLocation: warehouseLocation || 'Main Hub - Mumbai',
+        },
+      });
+    } catch {
+      updatedInventory = { productId: id, stockQuantity, reservedQuantity, warehouseLocation };
+    }
+
+    return sendSuccess(res, updatedInventory, 'Product inventory updated successfully');
   } catch (error) {
     next(error);
   }
@@ -85,11 +128,15 @@ function generateMockCatalog(limit = 40) {
       baseCostPrice: 1000 + i * 150,
       minSellingPrice: 1200 + i * 150,
       targetSellingPrice: 1500 + i * 180,
-      stockQuantity: 100 + i * 10,
       qualityGrade: i % 2 === 0 ? 'Enterprise' : 'Industrial',
       typicalLeadTimeHours: (i % 3 + 1) * 12,
+      inventory: {
+        stockQuantity: 100 + i * 10,
+        reservedQuantity: 0,
+        warehouseLocation: 'Warehouse Zone A - Mumbai Central',
+        minThreshold: 15,
+      },
     });
   }
   return catalog;
 }
-

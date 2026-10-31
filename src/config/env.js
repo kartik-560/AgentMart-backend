@@ -9,6 +9,8 @@ const envSchema = z.object({
   DATABASE_URL: z.string().default('postgresql://postgres:postgres@localhost:5432/agentmart?schema=public'),
   GEMINI_API_KEY: z.string().optional().default(''),
   FRONTEND_URL: z.string().default('http://localhost:3000'),
+  JWT_SECRET: z.string().default('agentmart-super-secure-production-jwt-secret-key-2026'),
+  JWT_EXPIRES_IN: z.string().default('7d'),
 });
 
 const parsed = envSchema.safeParse(process.env);
