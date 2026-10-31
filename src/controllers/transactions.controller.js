@@ -271,3 +271,93 @@ export async function rejectTransaction(req, res, next) {
     next(error);
   }
 }
+
+
+export async function createTransaction(req, res, next) {
+  try {
+    const { negotiationId, offerId } = req.body;
+    if (!negotiationId && !offerId) {
+      return sendError(res, 'Either negotiationId or offerId is required', 400, 'ValidationError');
+    }
+
+    // Check if an existing transaction already exists
+    let existingTx = null;
+    try {
+      existingTx = await prisma.transaction.findFirst({
+        where: offerId ? { offerId } : { negotiationId },
+        include: {
+          buyerBusiness: { select: { name: true } },
+          sellerBusiness: { select: { name: true } },
+          offer: true,
+        },
+      });
+    } catch {}
+
+    if (existingTx) {
+      return sendSuccess(res, existingTx, 'Existing transaction retrieved', 200);
+    }
+
+    // Find recommended or best offer
+    let targetOffer = null;
+    try {
+      if (offerId) {
+        targetOffer = await prisma.offer.findUnique({
+          where: { id: offerId },
+          include: { sellerBusiness: true },
+        });
+      } else {
+        targetOffer = await prisma.offer.findFirst({
+          where: { negotiationId, isRecommended: true },
+          include: { sellerBusiness: true },
+        });
+        if (!targetOffer) {
+          targetOffer = await prisma.offer.findFirst({
+            where: { negotiationId },
+            orderBy: { utilityScore: 'desc' },
+            include: { sellerBusiness: true },
+          });
+        }
+      }
+    } catch {}
+
+    if (!targetOffer) {
+      return sendError(res, 'No eligible offer found to generate a transaction', 404, 'OfferNotFound');
+    }
+
+    let negotiation = null;
+    try {
+      negotiation = await prisma.negotiation.findUnique({
+        where: { id: targetOffer.negotiationId },
+      });
+    } catch {}
+
+    const newTx = await prisma.transaction.create({
+      data: {
+        negotiationId: targetOffer.negotiationId,
+        offerId: targetOffer.id,
+        buyerBusinessId: negotiation?.buyerBusinessId || targetOffer.sellerBusinessId,
+        sellerBusinessId: targetOffer.sellerBusinessId,
+        settlementAmount: targetOffer.totalPrice,
+        currency: 'INR',
+        paymentMethod: 'MOCK_UPI',
+        settlementStatus: 'PENDING_APPROVAL',
+        humanApprovalRequired: true,
+        mockUpiVpa: 'prismwholesale@icici',
+      },
+      include: {
+        buyerBusiness: { select: { name: true } },
+        sellerBusiness: { select: { name: true } },
+        offer: true,
+      },
+    });
+
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('transaction:approval_requested', newTx);
+    }
+
+    return sendSuccess(res, newTx, 'Pending transaction created for human approval', 201);
+  } catch (error) {
+    next(error);
+  }
+}
