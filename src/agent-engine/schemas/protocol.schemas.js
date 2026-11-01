@@ -37,6 +37,7 @@ export const AgentProposalSchema = z.object({
   unitPrice: z.number().positive(),
   declaredFees: z.number().nonnegative().default(0),
   totalPrice: z.number().positive(),
+  maxBudget: z.number().positive().optional(),
   deliveryLeadTimeHours: z.number().int().positive(),
   qualityGrade: z.string().default('Standard'),
   paymentMethodRequested: z.string().default('MOCK_UPI'),
@@ -66,10 +67,10 @@ export const WireMessageSchema = z.object({
 });
 
 export const NegotiationConstraintsSchema = z.object({
-  maxBudget: z.number().positive().default(50000),
-  maxDeliveryHours: z.number().int().positive().default(48),
-  targetResaleMargin: z.number().positive().default(25),
-  minAcceptableMargin: z.number().positive().default(18),
+  maxBudget: z.coerce.number().positive().default(50000),
+  maxDeliveryHours: z.coerce.number().int().positive().default(48),
+  targetResaleMargin: z.coerce.number().positive().default(25),
+  minAcceptableMargin: z.coerce.number().positive().default(18),
   qualityTierRequirement: z.string().default('Enterprise'),
   paymentPreferences: z.array(z.string()).default(['MOCK_UPI', 'ESCROW']),
   riskTolerance: z.enum(['CONSERVATIVE', 'BALANCED', 'AGGRESSIVE']).default('BALANCED'),

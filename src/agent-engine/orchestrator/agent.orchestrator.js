@@ -54,6 +54,15 @@ export class AgentOrchestrator {
     this.sellerB.resetSession(negotiationId);
     this.sellerC.resetSession(negotiationId);
 
+    // Apply exact validated constraints to Buyer Agent configuration
+    this.buyer.configuration = {
+      ...this.buyer.configuration,
+      ...validatedConstraints,
+      maxBudget: Number(validatedConstraints.maxBudget),
+      maxDeliveryHours: Number(validatedConstraints.maxDeliveryHours),
+      targetResaleMargin: Number(validatedConstraints.targetResaleMargin),
+    };
+
     const session = {
       negotiationId,
       product,
@@ -72,8 +81,13 @@ export class AgentOrchestrator {
       updatedAt: new Date().toISOString(),
     };
 
-    // Generate Buyer RFQ
-    const rfqMessage = this.buyer.createRfq({ negotiationId, product, quantity });
+    // Generate Buyer RFQ with exact product, quantity, and budget constraints
+    const rfqMessage = this.buyer.createRfq({
+      negotiationId,
+      product,
+      quantity,
+      constraints: validatedConstraints,
+    });
     rfqMessage.senderRole = 'BUYER';
     rfqMessage.agentId = this.buyer.id;
     session.messages.push(rfqMessage);
@@ -157,10 +171,11 @@ export class AgentOrchestrator {
     await this.syncAgentsFromDatabase();
 
     // Dynamically bind the specific buyer business & buyer agent for this negotiation
+    let dbNeg = null;
     try {
-      const dbNeg = await prisma.negotiation.findUnique({
+      dbNeg = await prisma.negotiation.findUnique({
         where: { id: negotiationId },
-        include: { buyerBusiness: true, buyerAgent: true },
+        include: { buyerBusiness: true, buyerAgent: true, targetProduct: true },
       });
       if (dbNeg?.buyerBusiness) {
         this.buyer.businessProfile.businessId = dbNeg.buyerBusiness.id;
@@ -171,7 +186,6 @@ export class AgentOrchestrator {
         this.buyer.id = dbNeg.buyerAgent.id;
         this.buyer.name = dbNeg.buyerAgent.name;
         this.buyer.systemPrompt = dbNeg.buyerAgent.systemPrompt || this.buyer.systemPrompt;
-        this.buyer.configuration = { ...this.buyer.configuration, ...(dbNeg.buyerAgent.configuration || {}) };
       }
     } catch {}
 
@@ -191,7 +205,19 @@ export class AgentOrchestrator {
     session.status = 'SOLICITING_BIDS';
     session.updatedAt = new Date().toISOString();
 
-    const activeConstraints = { ...session.constraints, ...constraints };
+    const activeConstraints = {
+      ...session.constraints,
+      ...constraints,
+      maxBudget: Number(dbNeg?.maxBudget ?? (constraints?.maxBudget || session?.constraints?.maxBudget || 50000)),
+      maxDeliveryHours: Number(dbNeg?.maxDeliveryHours ?? (constraints?.maxDeliveryHours || session?.constraints?.maxDeliveryHours || 48)),
+      targetResaleMargin: Number(dbNeg?.targetResaleMargin ?? (constraints?.targetResaleMargin || session?.constraints?.targetResaleMargin || 25)),
+    };
+
+    // Keep buyer agent configuration strictly in sync with saved RFQ budget & SLA constraints
+    this.buyer.configuration = {
+      ...this.buyer.configuration,
+      ...activeConstraints,
+    };
 
     // CORE RULE: Match products using SKU/product identity and check product availability and stock
     let eligibleParticipants = session?.eligibleParticipants;
@@ -404,11 +430,12 @@ export class AgentOrchestrator {
     // 3. Buyer Agent Evaluation & Strategic Counter-Proposal
     const buyerEval = await this.buyer.evaluateOffers({
       negotiationId,
-      product,
-      quantity,
+      product: dbNeg?.targetProduct || product,
+      quantity: Number(dbNeg?.targetQuantity || quantity),
       roundNumber,
       maxRounds: activeConstraints.maxRounds || 5,
       offers: evaluatedOffers,
+      constraints: activeConstraints,
       supplierMemory: { 'SELLER_A_PRICE': 88, 'SELLER_B_SPEED_QUALITY': 95, 'SELLER_C_MALICIOUS': 35 },
     });
 

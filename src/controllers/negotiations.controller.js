@@ -158,7 +158,15 @@ export async function getNegotiationById(req, res, next) {
 
     return sendSuccess(
       res,
-      { ...negotiation, messages, eligibleParticipants, isEligible, ineligibilityNotice },
+      {
+        ...negotiation,
+        maxBudget: Number(negotiation.maxBudget),
+        targetQuantity: Number(negotiation.targetQuantity),
+        messages,
+        eligibleParticipants,
+        isEligible,
+        ineligibilityNotice,
+      },
       'Negotiation details retrieved'
     );
   } catch (error) {

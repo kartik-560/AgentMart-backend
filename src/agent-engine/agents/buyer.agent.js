@@ -35,15 +35,21 @@ export class BuyerAgent extends BaseAgent {
   /**
    * Generates initial Request for Quotation (RFQ)
    */
-  createRfq({ negotiationId, product, quantity }) {
+  createRfq({ negotiationId, product, quantity, constraints = {} }) {
     this.state.negotiationId = negotiationId;
-    const targetRetailPrice = Number(product.targetSellingPrice);
-    const maxBudget = this.configuration.maxBudget;
+    if (constraints && Object.keys(constraints).length > 0) {
+      this.configuration = { ...this.configuration, ...constraints };
+    }
+
+    const unitWholesaleCost = Number(product.baseCostPrice || product.minSellingPrice || product.targetSellingPrice || 0);
+    const maxBudget = Number(this.configuration.maxBudget);
+    const maxDeliveryHours = Number(this.configuration.maxDeliveryHours || 48);
+    const totalEstimatedCost = Math.round(unitWholesaleCost * Number(quantity));
 
     const bizName = this.businessProfile.businessName || this.name || 'Enterprise Buyer';
 
-    const content = `${bizName} is soliciting competitive wholesale proposals for ${quantity} units of ${product.name} (SKU: ${product.sku}).
-Commercial Constraints: Hard expenditure ceiling of ₹${maxBudget.toLocaleString()}, maximum delivery lead time of ${this.configuration.maxDeliveryHours} hours, payment via verified platform MOCK_UPI. All proposals must include certified quality grades and transparent warranty terms.`;
+    const content = `${bizName} is soliciting competitive wholesale proposals for ${quantity} unit(s) of ${product.name} (SKU: ${product.sku}).
+Commercial Constraints: Hard expenditure ceiling of ₹${maxBudget.toLocaleString()} (Wholesale Base Cost: ₹${unitWholesaleCost.toLocaleString()}/unit, Total Estimated Base: ₹${totalEstimatedCost.toLocaleString()}), maximum delivery lead time of ${maxDeliveryHours} hours, payment via verified platform MOCK_UPI. All proposals must include certified quality grades and transparent warranty terms.`;
 
     const rfqMessage = {
       protocolVersion: '1.0',
@@ -62,15 +68,16 @@ Commercial Constraints: Hard expenditure ceiling of ₹${maxBudget.toLocaleStrin
       content,
       proposal: {
         sku: product.sku,
-        quantity,
-        unitPrice: Math.round(maxBudget / quantity),
+        quantity: Number(quantity),
+        unitPrice: unitWholesaleCost,
         declaredFees: 0,
-        totalPrice: maxBudget,
-        deliveryLeadTimeHours: this.configuration.maxDeliveryHours,
-        qualityGrade: this.configuration.qualityTierRequirement,
+        totalPrice: totalEstimatedCost,
+        maxBudget: maxBudget,
+        deliveryLeadTimeHours: maxDeliveryHours,
+        qualityGrade: this.configuration.qualityTierRequirement || 'Enterprise',
         paymentMethodRequested: 'MOCK_UPI',
         warrantyMonths: 12,
-        notes: `Procurement RFQ for ${quantity}x ${product.name}`,
+        notes: `Procurement RFQ for ${quantity}x ${product.name}. Authorized ceiling: ₹${maxBudget.toLocaleString()}`,
       },
       securityValidation: {
         status: 'PASSED',
@@ -86,20 +93,26 @@ Commercial Constraints: Hard expenditure ceiling of ₹${maxBudget.toLocaleStrin
   /**
    * Evaluates competing offers and generates strategic counteroffers or final deal recommendation
    */
-  async evaluateOffers({ negotiationId, product, quantity, roundNumber, maxRounds = 5, offers, supplierMemory = {} }) {
+  async evaluateOffers({ negotiationId, product, quantity, roundNumber, maxRounds = 5, offers, constraints = {}, supplierMemory = {} }) {
     this.state.negotiationId = negotiationId;
     this.state.currentRound = roundNumber;
 
-    // Filter compliant vs flagged offers
+    if (constraints && Object.keys(constraints).length > 0) {
+      this.configuration = { ...this.configuration, ...constraints };
+    }
+    const maxBudget = Number(this.configuration.maxBudget);
+    const maxDeliveryHours = Number(this.configuration.maxDeliveryHours || 48);
+
+    // Filter compliant vs flagged offers strictly against budget ceiling and delivery SLA
     const validOffers = offers.filter(
-      (o) => !o.hiddenFeeDetected && o.status !== 'FLAGGED' && o.totalPrice <= this.configuration.maxBudget && o.deliveryHours <= this.configuration.maxDeliveryHours
+      (o) => !o.hiddenFeeDetected && o.status !== 'FLAGGED' && o.totalPrice <= maxBudget && o.deliveryHours <= maxDeliveryHours
     );
 
     const rankedValid = DecisionEngine.rankOffers(validOffers);
     const topOffer = rankedValid[0] || null;
 
     // Target retail price for margin computations
-    const retailPrice = Number(product.targetSellingPrice);
+    const retailPrice = Number(product.targetSellingPrice || (product.baseCostPrice ? product.baseCostPrice * 1.3 : maxBudget / quantity));
 
     // Build LLM Prompt
     const prompt = NEGOTIATION_PROMPTS.buildBuyerEvaluationPrompt({
@@ -119,7 +132,7 @@ Commercial Constraints: Hard expenditure ceiling of ₹${maxBudget.toLocaleStrin
 \`\`\`json
 {
   "intent": "REJECT_ALL",
-  "reasoning": "Every submitted proposal breached the hard budget ceiling of ₹${this.configuration.maxBudget.toLocaleString()}, failed the 48-hour delivery deadline, or concealed narrative fees.",
+  "reasoning": "Every submitted proposal breached the hard budget ceiling of ₹${maxBudget.toLocaleString()}, failed the ${maxDeliveryHours}-hour delivery deadline, or concealed narrative fees.",
   "counterOffers": [],
   "recommendedSellerRole": null,
   "explanation": "Procurement halted due to non-compliant bids across all competing suppliers."
@@ -137,14 +150,14 @@ Commercial Constraints: Hard expenditure ceiling of ₹${maxBudget.toLocaleStrin
         // Recommend deal
         const winnerRole = topOffer.sellerType;
         const winnerName = topOffer.sellerBusinessName || topOffer.sellerAgentName || winnerRole;
-        const budgetSaved = this.configuration.maxBudget - topOffer.totalPrice;
+        const budgetSaved = Math.max(0, maxBudget - topOffer.totalPrice);
         const buyerOrg = this.businessProfile.businessName || this.name || 'Enterprise Procurement';
         return `${buyerOrg} concludes Round ${roundNumber}. Supplier [${winnerName}] satisfies all corporate mandates with a top utility score of ${topOffer.utilityScore}/100.
-Commercial Highlights: Total investment of ₹${topOffer.totalPrice.toLocaleString()} (saving ₹${budgetSaved.toLocaleString()} under our ₹${this.configuration.maxBudget.toLocaleString()} ceiling), projected gross resale margin of ${topMargin}%, fulfillment within ${topOffer.deliveryHours} hours, and verified zero-trust security clearance.
+Commercial Highlights: Total investment of ₹${topOffer.totalPrice.toLocaleString()} (saving ₹${budgetSaved.toLocaleString()} under our ₹${maxBudget.toLocaleString()} ceiling), projected gross resale margin of ${topMargin}%, fulfillment within ${topOffer.deliveryHours} hours, and verified zero-trust security clearance.
 \`\`\`json
 {
   "intent": "DEAL_RECOMMENDATION",
-  "reasoning": "Optimal multi-attribute utility achieved. Deal recommended for formal human authorization.",
+  "reasoning": "Optimal multi-attribute utility achieved within authorized ₹${maxBudget.toLocaleString()} budget. Deal recommended for formal human authorization.",
   "counterOffers": [],
   "recommendedSellerRole": "${winnerRole}",
   "explanation": "Supplier ${winnerRole} provides the highest combined utility score (${topOffer.utilityScore}) with verified compliance to all budget and SLA constraints."
@@ -152,39 +165,35 @@ Commercial Highlights: Total investment of ₹${topOffer.totalPrice.toLocaleStri
 \`\`\``;
       }
 
-      // Generate strategic counteroffers for suppliers
+      // Generate strategic counteroffers for suppliers dynamically based on product floor and budget cap
       const counterOffers = [];
+      const maxUnitPriceAllowed = Math.floor(maxBudget / quantity);
       for (const o of offers) {
-        if (o.sellerType === 'SELLER_A_PRICE' && !o.hiddenFeeDetected) {
-          // Counter Seller A for ₹3,700 to reach corporate 24.5% - 25% target margin
-          const targetUnit = Math.max(Number(product.minSellingPrice), 3700);
+        if (!o.hiddenFeeDetected && o.status !== 'FLAGGED') {
+          const discountFactor = o.sellerType === 'SELLER_B_SPEED_QUALITY' ? 0.98 : 0.95;
+          const targetUnit = Math.max(
+            Number(product.minSellingPrice || 0),
+            Math.min(Math.round(o.unitPrice * discountFactor), maxUnitPriceAllowed)
+          );
           counterOffers.push({
-            sellerRole: 'SELLER_A_PRICE',
+            sellerRole: o.sellerType,
+            sellerAgentId: o.sellerAgentId,
             targetUnitPrice: targetUnit,
-            demandedLeadTimeHours: Math.min(o.deliveryHours, 40),
-            rationale: `We require a wholesale unit price of ₹${targetUnit.toLocaleString()} to achieve our corporate 25% target resale margin. Delivery SLA of 40h is acceptable.`,
-          });
-        } else if (o.sellerType === 'SELLER_B_SPEED_QUALITY' && !o.hiddenFeeDetected) {
-          // Acknowledge Seller B's speed, request modest 2% price concession
-          const targetUnit = Math.max(Number(product.minSellingPrice), Math.round(o.unitPrice * 0.98));
-          counterOffers.push({
-            sellerRole: 'SELLER_B_SPEED_QUALITY',
-            targetUnitPrice: targetUnit,
-            demandedLeadTimeHours: 20,
-            rationale: `We value your 20-hour rapid dispatch and Enterprise-Plus QA grade. Concede unit price to ₹${targetUnit.toLocaleString()} to close this procurement cycle.`,
+            demandedLeadTimeHours: Math.min(o.deliveryHours || 48, maxDeliveryHours),
+            rationale: `We require a wholesale unit price of ₹${targetUnit.toLocaleString()} to align with our expenditure ceiling of ₹${maxBudget.toLocaleString()} and commercial margin targets.`,
           });
         }
       }
 
       return `Round ${roundNumber} Review: While supplier bids are promising, neither currently achieves our benchmark 85.0 utility threshold.
-Issuing targeted counter-proposals: Requesting volume concession from Seller A to reach our 25% target margin, and seeking price alignment from Seller B given their premium 20h SLA.
+Issuing targeted counter-proposals to extract improved pricing while preserving delivery SLAs within our ₹${maxBudget.toLocaleString()} expenditure ceiling.
 \`\`\`json
 {
   "intent": "COUNTER_OFFER",
-  "reasoning": "Countering suppliers to extract optimal unit pricing while preserving delivery SLAs.",
+  "reasoning": "Countering suppliers to extract optimal unit pricing within the authorized budget while preserving delivery SLAs.",
   "counterOffers": ${JSON.stringify(counterOffers)},
   "recommendedSellerRole": null,
-  "explanation": "Targeted counteroffers issued to Seller A and Seller B to improve commercial terms before round cutoff."
+  "explanation": "Targeted counteroffers issued to eligible suppliers to improve commercial terms before round cutoff."
 }
 \`\`\``;
     });

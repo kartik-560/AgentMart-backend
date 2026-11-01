@@ -46,18 +46,18 @@ export const ScoringWeightsSchema = z.object({
 }).partial();
 
 export const BuyerConstraintsSchema = z.object({
-  maxBudget: z.number().positive().default(50000.00),
-  maxDeliveryHours: z.number().int().positive().default(48),
-  minAcceptableMargin: z.number().min(0).max(100).default(18.00),
-  targetResaleMargin: z.number().min(0).max(100).default(25.00),
-  targetResalePrice: z.number().positive().optional(),
-  targetQuantity: z.number().int().positive().default(1),
+  maxBudget: z.coerce.number().positive().default(50000.00),
+  maxDeliveryHours: z.coerce.number().int().positive().default(48),
+  minAcceptableMargin: z.coerce.number().min(0).max(100).default(18.00),
+  targetResaleMargin: z.coerce.number().min(0).max(100).default(25.00),
+  targetResalePrice: z.coerce.number().positive().optional(),
+  targetQuantity: z.coerce.number().int().positive().default(1),
   allowedPaymentMethods: z.array(z.string()).default(['MOCK_UPI', 'ESCROW']),
   minQualityGrade: QualityGradeEnum.optional(),
   weights: ScoringWeightsSchema.optional(),
-  productCatalogLeadTime: z.number().int().nonnegative().optional(),
-  productCatalogStock: z.number().int().nonnegative().optional(),
-  productBaseCost: z.number().nonnegative().optional(),
+  productCatalogLeadTime: z.coerce.number().int().nonnegative().optional(),
+  productCatalogStock: z.coerce.number().int().nonnegative().optional(),
+  productBaseCost: z.coerce.number().nonnegative().optional(),
 });
 
 export const SupplierOfferSchema = z.object({

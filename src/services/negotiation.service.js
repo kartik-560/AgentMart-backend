@@ -21,17 +21,26 @@ export class NegotiationService {
    * Initializes a new procurement negotiation session
    */
   static async createNegotiation(data, user, io = null) {
-    const { targetProductId, targetQuantity, maxBudget, maxDeliveryHours, targetResaleMargin } = data;
+    const { targetProductId, targetQuantity, maxBudget, maxDeliveryHours, targetResaleMargin, targetSku } = data;
 
     let product = null;
     let buyerBusiness = null;
     let buyerAgent = null;
 
     try {
-      product = await prisma.product.findUnique({
-        where: { id: targetProductId },
-        include: { inventory: true, business: true },
-      });
+      if (targetProductId) {
+        product = await prisma.product.findUnique({
+          where: { id: targetProductId },
+          include: { inventory: true, business: true },
+        });
+      }
+
+      if (!product && (targetSku || data.sku)) {
+        product = await prisma.product.findFirst({
+          where: { sku: { equals: targetSku || data.sku, mode: 'insensitive' } },
+          include: { inventory: true, business: true },
+        });
+      }
 
       if (user?.businessId) {
         buyerBusiness = await prisma.business.findUnique({
@@ -69,26 +78,40 @@ export class NegotiationService {
       }
     } catch {}
 
-    const title = `Procurement: ${targetQuantity}x ${product?.name || 'Enterprise Items'}`;
+    const unitCost = Number(product?.baseCostPrice || product?.minSellingPrice || product?.targetSellingPrice || 0);
+    const parsedQuantity = Number(targetQuantity || 1);
+    const estimatedTotalCost = Math.round(unitCost * parsedQuantity);
+    const parsedMaxBudget = Number(maxBudget || (estimatedTotalCost > 0 ? Math.round(estimatedTotalCost * 1.1) : 50000));
+    const parsedDeliveryHours = Number(maxDeliveryHours || 48);
+    const parsedResaleMargin = Number(targetResaleMargin || 25);
+
+    const title = `Procurement: ${parsedQuantity}x ${product?.name || 'Enterprise Items'}`;
 
     // CORE RULE: Search all registered sellers' active product catalogues.
     // Match products using exact SKU/product identity, and check product availability & stock >= targetQuantity
     const eligibleSellers = await findEligibleSellersForProduct({
       targetProductId: product?.id || targetProductId,
-      targetSku: product?.sku,
-      targetQuantity: Number(targetQuantity),
+      targetSku: product?.sku || targetSku,
+      targetQuantity: parsedQuantity,
       buyerBusinessId: buyerBusiness?.id,
     });
 
     const isEligibleFound = eligibleSellers.length > 0;
     const initialStatus = isEligibleFound ? 'INITIATED' : 'NO_ELIGIBLE_SELLERS';
     const initialSummary = isEligibleFound
-      ? `Procurement RFQ solicited to ${eligibleSellers.length} eligible supplier(s) with confirmed stock for SKU [${product?.sku}].`
-      : `No eligible sellers found for this product: No registered supplier has [${product?.name || 'item'}] (SKU: ${product?.sku}) with at least ${targetQuantity} units in stock.`;
+      ? `Procurement RFQ solicited to ${eligibleSellers.length} eligible supplier(s) with confirmed stock for SKU [${product?.sku || targetSku}].`
+      : `No eligible sellers found for this product: No registered supplier has [${product?.name || 'item'}] (SKU: ${product?.sku || targetSku}) with at least ${parsedQuantity} units in stock.`;
 
     const metadata = {
-      targetSku: product?.sku,
-      targetQuantity: Number(targetQuantity),
+      targetProductId: product?.id || targetProductId,
+      targetSku: product?.sku || targetSku,
+      productName: product?.name,
+      unitWholesaleCost: unitCost,
+      estimatedTotalCost,
+      maxBudget: parsedMaxBudget,
+      targetQuantity: parsedQuantity,
+      maxDeliveryHours: parsedDeliveryHours,
+      targetResaleMargin: parsedResaleMargin,
       eligibleParticipants: eligibleSellers,
       noEligibleSellers: !isEligibleFound,
     };
@@ -104,10 +127,10 @@ export class NegotiationService {
           buyerAgentId: buyerAgent?.id,
           status: initialStatus,
           summary: initialSummary,
-          maxBudget,
-          maxDeliveryHours,
-          targetQuantity: Number(targetQuantity),
-          targetResaleMargin,
+          maxBudget: parsedMaxBudget,
+          maxDeliveryHours: parsedDeliveryHours,
+          targetQuantity: parsedQuantity,
+          targetResaleMargin: parsedResaleMargin,
           currentRound: isEligibleFound ? 1 : 0,
           metadata,
         },
@@ -122,7 +145,7 @@ export class NegotiationService {
           action: isEligibleFound ? 'INITIATED' : 'NO_ELIGIBLE_SELLERS',
           actorType: user?.role ? 'HUMAN' : 'SYSTEM',
           actorId: user?.id || 'system-orchestrator',
-          newState: { maxBudget, maxDeliveryHours, targetQuantity, eligibleSellers: eligibleSellers.length },
+          newState: { maxBudget: parsedMaxBudget, maxDeliveryHours: parsedDeliveryHours, targetQuantity: parsedQuantity, eligibleSellers: eligibleSellers.length },
           tamperProofHash: crypto.createHash('sha256').update(`${negotiation.id}-${initialStatus}-${Date.now()}`).digest('hex'),
         },
       });
@@ -139,7 +162,7 @@ export class NegotiationService {
       if (product?.inventory) {
         await prisma.inventory.update({
           where: { id: product.inventory.id },
-          data: { reservedQuantity: { increment: Number(targetQuantity) } },
+          data: { reservedQuantity: { increment: parsedQuantity } },
         });
       }
 
@@ -147,17 +170,24 @@ export class NegotiationService {
       try {
         const engine = getNegotiationEngine(io);
         await engine.orchestrator.syncAgentsFromDatabase();
-        const activeProd = product || {
-          id: targetProductId,
-          name: 'Enterprise Items',
-          sku: 'ELEC-GEN',
-          targetSellingPrice: maxBudget / targetQuantity,
+        const activeProd = {
+          ...(product || {}),
+          id: product?.id || targetProductId,
+          name: product?.name || 'Enterprise Items',
+          sku: product?.sku || targetSku || 'ELEC-GEN',
+          baseCostPrice: unitCost,
+          minSellingPrice: Number(product?.minSellingPrice || unitCost),
+          targetSellingPrice: Number(product?.targetSellingPrice || (unitCost > 0 ? unitCost * 1.3 : parsedMaxBudget / parsedQuantity)),
         };
         const session = engine.orchestrator.initiateSession({
           negotiationId: negotiation.id,
           product: activeProd,
-          quantity: Number(targetQuantity),
-          constraints: { maxBudget, maxDeliveryHours, targetResaleMargin },
+          quantity: parsedQuantity,
+          constraints: {
+            maxBudget: parsedMaxBudget,
+            maxDeliveryHours: parsedDeliveryHours,
+            targetResaleMargin: parsedResaleMargin,
+          },
           buyerAgent: buyerAgent || { id: negotiation.buyerAgentId, name: `${buyerBusiness?.name || 'Enterprise'} Buyer Agent` },
           buyerBusiness: buyerBusiness || { id: negotiation.buyerBusinessId, name: buyerBusiness?.name || 'Enterprise Buyer' },
           eligibleParticipants: eligibleSellers,
@@ -186,10 +216,10 @@ export class NegotiationService {
         id: `neg-${Date.now()}`,
         title,
         targetProductId,
-        targetQuantity,
-        maxBudget,
-        maxDeliveryHours,
-        targetResaleMargin,
+        targetQuantity: parsedQuantity,
+        maxBudget: parsedMaxBudget,
+        maxDeliveryHours: parsedDeliveryHours,
+        targetResaleMargin: parsedResaleMargin,
         currentRound: isEligibleFound ? 1 : 0,
         status: initialStatus,
         summary: initialSummary,
@@ -231,10 +261,10 @@ export class NegotiationService {
       targetSellingPrice: 4200,
     };
 
-    const quantity = negotiation?.targetQuantity || 12;
+    const quantity = Number(negotiation?.targetQuantity || 1);
     const constraints = {
-      maxBudget: Number(negotiation?.maxBudget || 50000),
-      maxDeliveryHours: negotiation?.maxDeliveryHours || 48,
+      maxBudget: Number(negotiation?.maxBudget),
+      maxDeliveryHours: Number(negotiation?.maxDeliveryHours || 48),
       targetResaleMargin: Number(negotiation?.targetResaleMargin || 25),
     };
 
@@ -382,9 +412,11 @@ export class NegotiationService {
         }
       }
 
-      // If no offer was explicitly marked recommended yet convergence reached, pick highest utility clean offer
+      // If no offer was explicitly marked recommended yet convergence reached, pick highest utility clean offer strictly under budget
       if (!recommendedDbOffer && persistedOffers.length > 0) {
-        const cleanOffers = persistedOffers.filter((o) => !o.hiddenFeeDetected && o.status === 'PENDING' && o.sellerType !== 'SELLER_C_MALICIOUS');
+        const cleanOffers = persistedOffers.filter(
+          (o) => !o.hiddenFeeDetected && o.status === 'PENDING' && o.sellerType !== 'SELLER_C_MALICIOUS' && o.totalPrice <= Number(negotiation.maxBudget)
+        );
         if (cleanOffers.length > 0) {
           cleanOffers.sort((a, b) => (b.utilityScore || 0) - (a.utilityScore || 0));
           const best = cleanOffers[0];
