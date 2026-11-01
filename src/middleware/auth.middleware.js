@@ -8,15 +8,7 @@ export async function authenticateToken(req, res, next) {
   const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
 
   if (!token) {
-    // In local demo/development mode without auth headers, provide operator context
-    req.user = {
-      id: 'usr-default-operator',
-      email: 'procurement@apexretail.in',
-      name: 'Kartik - Senior Procurement Director',
-      role: 'BUYER_OFFICER',
-      businessId: 'biz-apex-retail',
-    };
-    return next();
+    return sendError(res, 'Authentication required. No authorization token provided.', 401, 'Unauthorized');
   }
 
   try {
@@ -27,16 +19,26 @@ export async function authenticateToken(req, res, next) {
         where: { id: decoded.userId },
         include: { business: true },
       });
-    } catch {
-      // Fallback to decoded payload if DB is in simulation mode
+    } catch (dbErr) {
+      console.warn('DB lookup during auth notice:', dbErr?.message);
     }
 
-    req.user = user || {
-      id: decoded.userId,
-      email: decoded.email,
-      name: decoded.name,
-      role: decoded.role || 'OPERATOR',
-      businessId: decoded.businessId,
+    if (!user) {
+      user = {
+        id: decoded.userId,
+        email: decoded.email,
+        name: decoded.name,
+        role: decoded.role || 'OPERATOR',
+        businessId: decoded.businessId,
+        business: null,
+      };
+    }
+
+    const accountType = decoded.accountType || (user.role === 'SUPPLIER_REP' || user.role === 'SELLER' ? 'SELLER' : 'BUYER');
+
+    req.user = {
+      ...user,
+      accountType,
     };
 
     next();
@@ -51,11 +53,23 @@ export function requireRole(...allowedRoles) {
       return sendError(res, 'Authentication required', 401, 'Unauthorized');
     }
 
-    if (!allowedRoles.includes(req.user.role) && req.user.role !== 'ADMIN') {
-      return sendError(res, `Access denied: requires one of roles [${allowedRoles.join(', ')}]`, 403, 'Forbidden');
+    const userRole = req.user.role;
+    const accountType = req.user.accountType;
+
+    const hasRole =
+      allowedRoles.includes(userRole) ||
+      allowedRoles.includes(accountType) ||
+      userRole === 'ADMIN';
+
+    if (!hasRole) {
+      return sendError(
+        res,
+        `Access denied: this operation requires one of authorized roles [${allowedRoles.join(', ')}]`,
+        403,
+        'Forbidden'
+      );
     }
 
     next();
   };
 }
-

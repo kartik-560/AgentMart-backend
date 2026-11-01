@@ -1,5 +1,6 @@
 import { geminiClient } from '../../config/gemini.js';
 import { logger } from '../../utils/logger.js';
+import { prisma } from '../../config/prisma.js';
 import { LLMSellerProposalSchema, LLMBuyerEvaluationSchema } from '../schemas/llm.schemas.js';
 
 function cleanNum(v) {
@@ -15,7 +16,7 @@ function cleanNum(v) {
  * Base Agent
  * Abstract base class for all autonomous marketplace agents.
  * Enforces independent state, isolated memory contexts, Gemini LLM reasoning,
- * and deterministic fallback simulation.
+ * and dynamic catalogue connectivity directly from PostgreSQL.
  */
 export class BaseAgent {
   constructor({ id, name, agentType, businessProfile = {}, systemPrompt, configuration = {} }) {
@@ -52,6 +53,58 @@ export class BaseAgent {
       receivedMessages: [],
       offerHistory: [],
     };
+  }
+
+  /**
+   * Resolves the real catalogue product directly from this seller's PostgreSQL catalogue.
+   * Ensures agents quote strictly based on products that exist in the database,
+   * reflecting the latest stock, pricing, and lead time updates.
+   */
+  async resolveCatalogueProduct(targetProduct) {
+    const businessId = this.businessProfile?.businessId;
+    if (!businessId || !targetProduct) return null;
+
+    try {
+      // 1. Look up direct match by id, sku, or name in this seller's active catalogue
+      const directMatch = await prisma.product.findFirst({
+        where: {
+          businessId,
+          isActive: true,
+          OR: [
+            ...(targetProduct.id ? [{ id: targetProduct.id }] : []),
+            ...(targetProduct.sku ? [{ sku: { equals: targetProduct.sku, mode: 'insensitive' } }] : []),
+            ...(targetProduct.name ? [{ name: { equals: targetProduct.name, mode: 'insensitive' } }] : []),
+          ],
+        },
+        include: { inventory: true },
+      });
+
+      if (directMatch) return directMatch;
+
+      // 2. Look up matching product in same category in this seller's catalogue
+      if (targetProduct.category) {
+        const catMatch = await prisma.product.findFirst({
+          where: {
+            businessId,
+            isActive: true,
+            category: { equals: targetProduct.category, mode: 'insensitive' },
+          },
+          include: { inventory: true },
+        });
+        if (catMatch) return catMatch;
+      }
+
+      // 3. Look up any active product owned by this seller
+      const anyMatch = await prisma.product.findFirst({
+        where: { businessId, isActive: true },
+        include: { inventory: true },
+      });
+
+      return anyMatch || null;
+    } catch (err) {
+      logger.warn(`Failed to resolve catalogue product for business ${businessId}: ${err?.message}`);
+      return null;
+    }
   }
 
   /**

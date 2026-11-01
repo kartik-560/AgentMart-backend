@@ -19,7 +19,7 @@ export function errorHandler(err, req, res, next) {
   }
 
   const statusCode = err.statusCode || 500;
-  const message = err.isOperational ? err.message : 'An unexpected internal error occurred';
-  return sendError(res, message, statusCode, err.name || 'InternalError', err.details || null);
+  const message = (err.statusCode && err.statusCode < 500) || err.isOperational ? err.message : 'An unexpected internal error occurred';
+  return sendError(res, message, statusCode, err.name || 'Error', err.details || null);
 }
 

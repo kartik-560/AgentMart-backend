@@ -8,10 +8,12 @@ import negotiationsRoutes from './negotiations.routes.js';
 import transactionsRoutes from './transactions.routes.js';
 import securityRoutes from './security.routes.js';
 import auditRoutes from './audit.routes.js';
+import sellerRoutes from './seller.routes.js';
 
 const apiRouter = Router();
 
 apiRouter.use('/auth', authRoutes);
+apiRouter.use('/seller', sellerRoutes);
 apiRouter.use('/health', healthRoutes);
 apiRouter.use('/business', businessRoutes);
 apiRouter.use('/products', productsRoutes);

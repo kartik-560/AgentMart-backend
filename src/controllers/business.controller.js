@@ -4,11 +4,19 @@ import { sendSuccess } from '../utils/response.js';
 export async function getBusinessProfile(req, res, next) {
   try {
     let business = null;
+    const businessId = req.user?.businessId;
     try {
-      business = await prisma.business.findFirst({
-        where: { businessType: 'RETAIL_ENTERPRISE' },
-        include: { profile: true, businessMemory: true, agents: true },
-      });
+      if (businessId) {
+        business = await prisma.business.findUnique({
+          where: { id: businessId },
+          include: { profile: true, businessMemory: true, agents: true },
+        });
+      } else {
+        business = await prisma.business.findFirst({
+          where: { businessType: 'RETAIL_ENTERPRISE' },
+          include: { profile: true, businessMemory: true, agents: true },
+        });
+      }
     } catch {
       // Fallback
     }
@@ -63,10 +71,13 @@ export async function updateBusinessProfile(req, res, next) {
     let updated = null;
 
     try {
-      const existing = await prisma.business.findFirst({
-        where: { businessType: 'RETAIL_ENTERPRISE' },
-        include: { profile: true },
-      });
+      const businessId = req.user?.businessId;
+      const existing = businessId
+        ? await prisma.business.findUnique({ where: { id: businessId }, include: { profile: true } })
+        : await prisma.business.findFirst({
+            where: { businessType: 'RETAIL_ENTERPRISE' },
+            include: { profile: true },
+          });
 
       if (existing) {
         updated = await prisma.business.update({

@@ -139,7 +139,7 @@ async function main() {
   const buyerAgent = await prisma.agent.create({
     data: {
       businessId: buyerBusiness.id,
-      name: "Apex Autonomous Buyer (Gemini-2.0)",
+      name: "Apex Autonomous Buyer",
       agentType: "BUYER",
       status: "ACTIVE",
       trustScore: 98.5,
@@ -259,6 +259,37 @@ async function main() {
   });
 
   console.log("🏢 Created 4 Businesses, Profiles & Agents.");
+
+  // Seed Demo Seller Users
+  await prisma.user.create({
+    data: {
+      email: "seller-a@prismwholesale.in",
+      passwordHash: defaultPasswordHash,
+      name: "Prism Sales Director (Seller A)",
+      role: "SUPPLIER_REP",
+      businessId: sellerABusiness.id,
+    }
+  });
+
+  await prisma.user.create({
+    data: {
+      email: "seller-b@swiftquality.in",
+      passwordHash: defaultPasswordHash,
+      name: "SwiftQuality Operations Lead (Seller B)",
+      role: "SUPPLIER_REP",
+      businessId: sellerBBusiness.id,
+    }
+  });
+
+  await prisma.user.create({
+    data: {
+      email: "seller-c@vortextrade.in",
+      passwordHash: defaultPasswordHash,
+      name: "Vortex Dynamic Representative (Seller C)",
+      role: "SUPPLIER_REP",
+      businessId: sellerCBusiness.id,
+    }
+  });
 
   // 3. Seed 40 SKUs with 1-to-1 Inventory
   const createdProducts = [];

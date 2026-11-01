@@ -6,8 +6,22 @@ import crypto from 'crypto';
 export async function getTransactions(req, res, next) {
   try {
     let transactions = [];
+    const user = req.user;
+    let whereClause = {};
+
+    if (user) {
+      if (user.accountType === 'SELLER' || user.role === 'SUPPLIER_REP') {
+        whereClause = { sellerBusinessId: user.businessId };
+      } else if (user.accountType === 'BUYER' || user.role === 'BUYER_OFFICER') {
+        if (user.businessId) {
+          whereClause = { buyerBusinessId: user.businessId };
+        }
+      }
+    }
+
     try {
       transactions = await prisma.transaction.findMany({
+        where: whereClause,
         include: {
           buyerBusiness: { select: { id: true, name: true, registrationNumber: true } },
           sellerBusiness: { select: { id: true, name: true, registrationNumber: true } },
@@ -74,6 +88,15 @@ export async function getTransactionById(req, res, next) {
       return sendError(res, 'Transaction not found in database', 404, 'NotFound');
     }
 
+    if (req.user) {
+      const isBuyer = req.user.businessId && req.user.businessId === tx.buyerBusinessId;
+      const isSeller = req.user.businessId && req.user.businessId === tx.sellerBusinessId;
+      const isAdmin = req.user.role === 'ADMIN' || req.user.role === 'OPERATOR';
+      if (!isBuyer && !isSeller && !isAdmin) {
+        return sendError(res, 'Access denied: You are not authorized to view this transaction', 403, 'Forbidden');
+      }
+    }
+
     return sendSuccess(res, tx, 'Transaction retrieved');
   } catch (error) {
     next(error);
@@ -125,6 +148,23 @@ export async function approveTransaction(req, res, next) {
 
     if (existingTx.settlementStatus === 'REJECTED') {
       return sendError(res, 'Transaction was rejected and cannot be settled.', 400, 'InvalidTransactionState');
+    }
+
+    // Backend Enforcement: Revalidate inventory before approving settlement
+    const targetProduct = existingTx?.offer?.product;
+    if (targetProduct) {
+      const liveInventory = await prisma.inventory.findUnique({
+        where: { productId: targetProduct.id },
+      });
+      const requiredQty = existingTx.offer?.quantity || existingTx.negotiation?.targetQuantity || 1;
+      if (!liveInventory || liveInventory.stockQuantity < requiredQty) {
+        return sendError(
+          res,
+          `Inventory shortfall: Available stock (${liveInventory?.stockQuantity || 0}) is insufficient for settlement of ${requiredQty} units.`,
+          400,
+          'InsufficientInventory'
+        );
+      }
     }
 
     const mockUpiRef = `UPI-TXN-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
@@ -244,6 +284,19 @@ export async function approveTransaction(req, res, next) {
     const io = req.app.get('io');
     if (io) {
       io.emit('transaction:settled', settledRecord);
+      if (existingTx.negotiationId) {
+        io.to(existingTx.negotiationId).emit('negotiation:closed', {
+          negotiationId: existingTx.negotiationId,
+          status: 'APPROVED',
+          settledRecord,
+          message: 'Procurement transaction authorized and settled. Live negotiation room is now closed.',
+        });
+        io.emit('negotiation:round_completed', {
+          negotiationId: existingTx.negotiationId,
+          status: 'APPROVED',
+          closed: true,
+        });
+      }
     }
 
     return sendSuccess(res, settledRecord, 'Transaction successfully approved and settled via Mock UPI');
@@ -365,18 +418,40 @@ export async function createTransaction(req, res, next) {
     let targetOffer = null;
 
     if (offerId) {
-      targetOffer = await prisma.offer.findUnique({
-        where: { id: offerId },
+      // 1. Fast check if a transaction already exists for this exact offerId
+      const existingTx = await prisma.transaction.findUnique({
+        where: { offerId },
         include: {
-          product: true,
+          buyerBusiness: true,
           sellerBusiness: true,
-          sellerAgent: true,
+          offer: {
+            include: {
+              product: true,
+              sellerAgent: true,
+              sellerBusiness: true,
+            },
+          },
           negotiation: {
             include: {
               targetProduct: true,
               buyerBusiness: true,
               buyerAgent: true,
             },
+          },
+          approvedBy: { select: { id: true, name: true, role: true } },
+        },
+      });
+
+      if (existingTx) {
+        return sendSuccess(res, existingTx, 'Existing transaction retrieved for selected offer', 200);
+      }
+
+      targetOffer = await prisma.offer.findUnique({
+        where: { id: offerId },
+        include: {
+          sellerBusiness: true,
+          negotiation: {
+            select: { buyerBusinessId: true },
           },
         },
       });
@@ -389,15 +464,9 @@ export async function createTransaction(req, res, next) {
         where: { negotiationId, isRecommended: true },
         orderBy: { roundNumber: 'desc' },
         include: {
-          product: true,
           sellerBusiness: true,
-          sellerAgent: true,
           negotiation: {
-            include: {
-              targetProduct: true,
-              buyerBusiness: true,
-              buyerAgent: true,
-            },
+            select: { buyerBusinessId: true },
           },
         },
       });
@@ -407,15 +476,9 @@ export async function createTransaction(req, res, next) {
           where: { negotiationId },
           orderBy: [{ roundNumber: 'desc' }, { utilityScore: 'desc' }],
           include: {
-            product: true,
             sellerBusiness: true,
-            sellerAgent: true,
             negotiation: {
-              include: {
-                targetProduct: true,
-                buyerBusiness: true,
-                buyerAgent: true,
-              },
+              select: { buyerBusinessId: true },
             },
           },
         });
@@ -424,34 +487,34 @@ export async function createTransaction(req, res, next) {
       if (!targetOffer) {
         return sendError(res, `No offers found for negotiation ${negotiationId}`, 404, 'OfferNotFound');
       }
-    }
 
-    // Check if a transaction ALREADY exists for this exact offerId
-    let existingTx = await prisma.transaction.findUnique({
-      where: { offerId: targetOffer.id },
-      include: {
-        buyerBusiness: true,
-        sellerBusiness: true,
-        offer: {
-          include: {
-            product: true,
-            sellerAgent: true,
-            sellerBusiness: true,
+      // Check if a transaction exists for this found offer
+      const existingTx = await prisma.transaction.findUnique({
+        where: { offerId: targetOffer.id },
+        include: {
+          buyerBusiness: true,
+          sellerBusiness: true,
+          offer: {
+            include: {
+              product: true,
+              sellerAgent: true,
+              sellerBusiness: true,
+            },
           },
-        },
-        negotiation: {
-          include: {
-            targetProduct: true,
-            buyerBusiness: true,
-            buyerAgent: true,
+          negotiation: {
+            include: {
+              targetProduct: true,
+              buyerBusiness: true,
+              buyerAgent: true,
+            },
           },
+          approvedBy: { select: { id: true, name: true, role: true } },
         },
-        approvedBy: { select: { id: true, name: true, role: true } },
-      },
-    });
+      });
 
-    if (existingTx) {
-      return sendSuccess(res, existingTx, 'Existing transaction retrieved for selected offer', 200);
+      if (existingTx) {
+        return sendSuccess(res, existingTx, 'Existing transaction retrieved for selected offer', 200);
+      }
     }
 
     const negotiation = targetOffer.negotiation;
@@ -496,32 +559,30 @@ export async function createTransaction(req, res, next) {
       },
     });
 
-    // Write audit log
-    try {
-      await prisma.auditLog.create({
-        data: {
-          entityType: 'TRANSACTION',
-          entityId: newTx.id,
-          action: 'CREATED',
-          actorType: 'SYSTEM',
-          actorId: targetOffer.sellerAgentId || 'system-orchestrator',
-          newState: {
-            transactionId: newTx.id,
-            negotiationId: newTx.negotiationId,
-            offerId: newTx.offerId,
-            settlementAmount: Number(newTx.settlementAmount),
-            settlementStatus: newTx.settlementStatus,
-          },
-          metadata: {
-            sellerBusinessId: newTx.sellerBusinessId,
-            buyerBusinessId: newTx.buyerBusinessId,
-            offerTotalPrice: Number(targetOffer.totalPrice),
-          },
+    // Write audit log asynchronously (non-blocking)
+    prisma.auditLog.create({
+      data: {
+        entityType: 'TRANSACTION',
+        entityId: newTx.id,
+        action: 'CREATED',
+        actorType: 'SYSTEM',
+        actorId: targetOffer.sellerAgentId || 'system-orchestrator',
+        newState: {
+          transactionId: newTx.id,
+          negotiationId: newTx.negotiationId,
+          offerId: newTx.offerId,
+          settlementAmount: Number(newTx.settlementAmount),
+          settlementStatus: newTx.settlementStatus,
         },
-      });
-    } catch (auditErr) {
+        metadata: {
+          sellerBusinessId: newTx.sellerBusinessId,
+          buyerBusinessId: newTx.buyerBusinessId,
+          offerTotalPrice: Number(targetOffer.totalPrice),
+        },
+      },
+    }).catch((auditErr) => {
       console.warn('AuditLog creation notice:', auditErr?.message);
-    }
+    });
 
     const io = req.app.get('io');
     if (io) {

@@ -11,6 +11,12 @@ const envSchema = z.object({
   FRONTEND_URL: z.string().default('http://localhost:3000'),
   JWT_SECRET: z.string().default('agentmart-super-secure-production-jwt-secret-key-2026'),
   JWT_EXPIRES_IN: z.string().default('7d'),
+  SMTP_HOST: z.string().optional().default('smtp.gmail.com'),
+  SMTP_PORT: z.union([z.string(), z.number()]).default(587).transform((val) => (typeof val === 'number' ? val : parseInt(val, 10) || 587)),
+  SMTP_SECURE: z.union([z.string(), z.boolean()]).default(false).transform((val) => val === true || val === 'true'),
+  SMTP_USER: z.string().optional().default(''),
+  SMTP_PASS: z.string().optional().default(''),
+  SMTP_FROM: z.string().optional().default('AgentMart Enterprise <no-reply@agentmart.in>'),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -21,4 +27,3 @@ if (!parsed.success) {
 }
 
 export const env = parsed.data;
-

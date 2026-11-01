@@ -25,7 +25,9 @@ export const AgentIntentEnum = z.enum([
 
 export const AgentSenderSchema = z.object({
   agentId: z.string().min(1),
+  name: z.string().optional(),
   businessId: z.string().min(1),
+  businessName: z.string().optional(),
   role: AgentRoleEnum,
 });
 
@@ -55,6 +57,8 @@ export const WireMessageSchema = z.object({
   roundNumber: z.number().int().nonnegative(),
   timestamp: z.string().datetime({ offset: true }).or(z.string().min(1)),
   sender: AgentSenderSchema,
+  senderRole: z.string().optional(),
+  agentId: z.string().optional(),
   intent: AgentIntentEnum,
   content: z.string(),
   proposal: AgentProposalSchema.nullable().optional(),

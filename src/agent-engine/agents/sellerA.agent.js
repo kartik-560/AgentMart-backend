@@ -40,8 +40,45 @@ export class SellerAAgent extends BaseAgent {
       this.recordReceivedMessage(buyerCounter);
     }
 
-    const catalogTarget = Number(product.targetSellingPrice);
-    const floorPrice = Number(product.minSellingPrice);
+    const bizName = this.businessProfile.businessName || this.name || 'Wholesale Supplier';
+
+    // 1. Resolve product strictly from this seller's database catalogue
+    const catalogueProduct = await this.resolveCatalogueProduct(product);
+    if (!catalogueProduct) {
+      const outOfStockMsg = `${bizName} cannot submit a quotation: ${product.name || 'Requested item'} is not in our active product catalogue. Please add this product to your Seller Product Catalogue to enable autonomous agent bidding.`;
+      const declinedProposal = {
+        unitPrice: 0,
+        quantity: 0,
+        declaredFees: 0,
+        totalPrice: 0,
+        deliveryLeadTimeHours: 0,
+        qualityGrade: 'Unavailable',
+        paymentMethodRequested: this.configuration.paymentMethod,
+        warrantyMonths: 0,
+        notes: 'Catalogue item not configured in database',
+        declined: true,
+      };
+      const quoteOutput = {
+        agentId: this.id,
+        name: this.name,
+        agentType: this.agentType,
+        businessId: this.businessProfile.businessId,
+        businessName: bizName,
+        roundNumber,
+        message: outOfStockMsg,
+        proposal: declinedProposal,
+        declined: true,
+      };
+      this.recordSentMessage(quoteOutput);
+      return quoteOutput;
+    }
+
+    // 2. Use real live catalogue pricing, floor price, stock & SLA
+    const activeProduct = catalogueProduct;
+    const catalogTarget = Number(activeProduct.targetSellingPrice);
+    const floorPrice = Number(activeProduct.minSellingPrice);
+    const deliveryLeadHours = Number(activeProduct.typicalLeadTimeHours || this.configuration.defaultDeliveryHours || 24);
+    const qualityGrade = activeProduct.qualityGrade || this.configuration.qualityGrade || 'Enterprise';
 
     // Calculate concession rate dynamically based on round and buyer's counter
     let discountRate = 0.08; // 8% initial discount in Round 1
@@ -71,7 +108,7 @@ export class SellerAAgent extends BaseAgent {
     const previousOffer = this.state.offerHistory[this.state.offerHistory.length - 1] || null;
 
     const prompt = NEGOTIATION_PROMPTS.buildSellerQuotePrompt({
-      product,
+      product: activeProduct,
       quantity,
       roundNumber,
       buyerRequest,
@@ -80,19 +117,18 @@ export class SellerAAgent extends BaseAgent {
     });
 
     const responseText = await this.generateResponse(prompt, () => {
-      // Dynamic non-hardcoded fallback simulation
       if (roundNumber === 1) {
-        return `Prism Wholesale Direct is pleased to submit our competitive wholesale quotation for ${quantity}x ${product.name}.
+        return `${bizName} is pleased to submit our competitive wholesale quotation for ${quantity}x ${activeProduct.name}.
 We offer a high-volume pricing discount at ₹${finalUnitPrice.toLocaleString()} per unit (Subtotal: ₹${total.toLocaleString()}, Zero added fees).
-Logistics: Dispatched directly from regional warehouse with guaranteed delivery in ${this.configuration.defaultDeliveryHours} hours.
+Logistics: Dispatched directly from regional warehouse with guaranteed delivery in ${deliveryLeadHours} hours.
 \`\`\`json
 {
   "unitPrice": ${finalUnitPrice},
   "quantity": ${quantity},
   "declaredFees": 0,
   "totalPrice": ${total},
-  "deliveryLeadTimeHours": ${this.configuration.defaultDeliveryHours},
-  "qualityGrade": "${this.configuration.qualityGrade}",
+  "deliveryLeadTimeHours": ${deliveryLeadHours},
+  "qualityGrade": "${qualityGrade}",
   "paymentMethodRequested": "${this.configuration.paymentMethod}",
   "warrantyMonths": ${this.configuration.warrantyMonths},
   "notes": "Includes standard 24-month wholesale replacement warranty."
@@ -100,17 +136,17 @@ Logistics: Dispatched directly from regional warehouse with guaranteed delivery 
 \`\`\``;
       }
 
-      return `Prism Wholesale Direct appreciates Apex Retail's counter-proposal in Round ${roundNumber}.
+      return `${bizName} appreciates the counter-proposal in Round ${roundNumber}.
 In the spirit of establishing a long-term enterprise partnership, we are approving an expanded bulk discount, reducing our unit price to ₹${finalUnitPrice.toLocaleString()} (Total order: ₹${total.toLocaleString()}).
-This delivers superior unit economics while maintaining our verified ${this.configuration.defaultDeliveryHours}-hour delivery SLA and ${this.configuration.warrantyMonths}-month warranty.
+This delivers superior unit economics while maintaining our verified ${deliveryLeadHours}-hour delivery SLA and ${this.configuration.warrantyMonths}-month warranty.
 \`\`\`json
 {
   "unitPrice": ${finalUnitPrice},
   "quantity": ${quantity},
   "declaredFees": 0,
   "totalPrice": ${total},
-  "deliveryLeadTimeHours": ${this.configuration.defaultDeliveryHours},
-  "qualityGrade": "${this.configuration.qualityGrade}",
+  "deliveryLeadTimeHours": ${deliveryLeadHours},
+  "qualityGrade": "${qualityGrade}",
   "paymentMethodRequested": "${this.configuration.paymentMethod}",
   "warrantyMonths": ${this.configuration.warrantyMonths},
   "notes": "Concession approved: Maximum volume discount applied protecting supplier floor margin."
@@ -123,8 +159,8 @@ This delivers superior unit economics while maintaining our verified ${this.conf
       quantity,
       declaredFees: 0,
       totalPrice: total,
-      deliveryLeadTimeHours: this.configuration.defaultDeliveryHours,
-      qualityGrade: this.configuration.qualityGrade,
+      deliveryLeadTimeHours: deliveryLeadHours,
+      qualityGrade: qualityGrade,
       paymentMethodRequested: this.configuration.paymentMethod,
       warrantyMonths: this.configuration.warrantyMonths,
       notes: 'Standard wholesale terms',
@@ -132,8 +168,10 @@ This delivers superior unit economics while maintaining our verified ${this.conf
 
     const quoteOutput = {
       agentId: this.id,
+      name: this.name,
       agentType: this.agentType,
       businessId: this.businessProfile.businessId,
+      businessName: bizName,
       roundNumber,
       message: responseText,
       proposal: parsedProposal,

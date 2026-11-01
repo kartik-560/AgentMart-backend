@@ -1,4 +1,5 @@
 import { prisma } from '../config/prisma.js';
+import { findEligibleSellersForProduct } from '../modules/products/productMatcher.js';
 import { NegotiationEngine } from '../agent-engine/negotiation/negotiation.engine.js';
 import { SecurityEngine } from '../agent-engine/security/security.engine.js';
 import { logger } from '../utils/logger.js';
@@ -29,18 +30,69 @@ export class NegotiationService {
     try {
       product = await prisma.product.findUnique({
         where: { id: targetProductId },
-        include: { inventory: true },
+        include: { inventory: true, business: true },
       });
-      buyerBusiness = await prisma.business.findFirst({
-        where: { businessType: 'RETAIL_ENTERPRISE' },
-        include: { agents: { where: { agentType: 'BUYER' } } },
-      });
+
+      if (user?.businessId) {
+        buyerBusiness = await prisma.business.findUnique({
+          where: { id: user.businessId },
+          include: { agents: { where: { agentType: 'BUYER' } } },
+        });
+      }
+
+      if (!buyerBusiness) {
+        buyerBusiness = await prisma.business.findFirst({
+          where: { businessType: 'RETAIL_ENTERPRISE' },
+          include: { agents: { where: { agentType: 'BUYER' } } },
+        });
+      }
+
       if (buyerBusiness?.agents?.length) {
         buyerAgent = buyerBusiness.agents[0];
+      }
+
+      if (buyerBusiness && !buyerAgent) {
+        try {
+          buyerAgent = await prisma.agent.create({
+            data: {
+              businessId: buyerBusiness.id,
+              name: `${buyerBusiness.name} Autonomous Agent`,
+              agentType: 'BUYER',
+              status: 'ACTIVE',
+              modelProvider: 'Google-Gemini',
+              modelName: 'gemini-2.0-flash',
+              trustScore: 98.5,
+              systemPrompt: `You are the autonomous procurement agent representing ${buyerBusiness.name}. Your objective is to negotiate optimal wholesale prices, strictly enforce delivery deadlines, reject hidden fees, and ensure human approval for settlements.`,
+            },
+          });
+        } catch {}
       }
     } catch {}
 
     const title = `Procurement: ${targetQuantity}x ${product?.name || 'Enterprise Items'}`;
+
+    // CORE RULE: Search all registered sellers' active product catalogues.
+    // Match products using exact SKU/product identity, and check product availability & stock >= targetQuantity
+    const eligibleSellers = await findEligibleSellersForProduct({
+      targetProductId: product?.id || targetProductId,
+      targetSku: product?.sku,
+      targetQuantity: Number(targetQuantity),
+      buyerBusinessId: buyerBusiness?.id,
+    });
+
+    const isEligibleFound = eligibleSellers.length > 0;
+    const initialStatus = isEligibleFound ? 'INITIATED' : 'NO_ELIGIBLE_SELLERS';
+    const initialSummary = isEligibleFound
+      ? `Procurement RFQ solicited to ${eligibleSellers.length} eligible supplier(s) with confirmed stock for SKU [${product?.sku}].`
+      : `No eligible sellers found for this product: No registered supplier has [${product?.name || 'item'}] (SKU: ${product?.sku}) with at least ${targetQuantity} units in stock.`;
+
+    const metadata = {
+      targetSku: product?.sku,
+      targetQuantity: Number(targetQuantity),
+      eligibleParticipants: eligibleSellers,
+      noEligibleSellers: !isEligibleFound,
+    };
+
     let negotiation = null;
 
     try {
@@ -48,40 +100,88 @@ export class NegotiationService {
         data: {
           title,
           targetProductId: product?.id || targetProductId,
-          buyerBusinessId: buyerBusiness?.id || 'biz-apex-retail',
-          buyerAgentId: buyerAgent?.id || 'agent-buyer-1',
-          status: 'INITIATED',
+          buyerBusinessId: buyerBusiness?.id || user?.businessId,
+          buyerAgentId: buyerAgent?.id,
+          status: initialStatus,
+          summary: initialSummary,
           maxBudget,
           maxDeliveryHours,
-          targetQuantity,
+          targetQuantity: Number(targetQuantity),
           targetResaleMargin,
-          currentRound: 1,
+          currentRound: isEligibleFound ? 1 : 0,
+          metadata,
         },
         include: { targetProduct: true, buyerBusiness: true, buyerAgent: true },
       });
-
-      // Reserve inventory
-      if (product?.inventory) {
-        await prisma.inventory.update({
-          where: { id: product.inventory.id },
-          data: { reservedQuantity: { increment: targetQuantity } },
-        });
-      }
 
       // Record audit
       await prisma.auditLog.create({
         data: {
           entityType: 'NEGOTIATION',
           entityId: negotiation.id,
-          action: 'INITIATED',
+          action: isEligibleFound ? 'INITIATED' : 'NO_ELIGIBLE_SELLERS',
           actorType: user?.role ? 'HUMAN' : 'SYSTEM',
           actorId: user?.id || 'system-orchestrator',
-          newState: { maxBudget, maxDeliveryHours, targetQuantity },
-          tamperProofHash: crypto.createHash('sha256').update(`${negotiation.id}-INITIATED-${Date.now()}`).digest('hex'),
+          newState: { maxBudget, maxDeliveryHours, targetQuantity, eligibleSellers: eligibleSellers.length },
+          tamperProofHash: crypto.createHash('sha256').update(`${negotiation.id}-${initialStatus}-${Date.now()}`).digest('hex'),
         },
       });
+
+      // If no eligible sellers found, do not broadcast RFQ or initiate rounds
+      if (!isEligibleFound) {
+        if (io) {
+          io.emit('negotiation:created', { ...negotiation, eligibleParticipants: [] });
+        }
+        return { ...negotiation, eligibleParticipants: [] };
+      }
+
+      // Reserve inventory on target product
+      if (product?.inventory) {
+        await prisma.inventory.update({
+          where: { id: product.inventory.id },
+          data: { reservedQuantity: { increment: Number(targetQuantity) } },
+        });
+      }
+
+      // Initialize Multi-Agent Engine Session & Save Round 0 RFQ message ONLY for eligible sellers
+      try {
+        const engine = getNegotiationEngine(io);
+        await engine.orchestrator.syncAgentsFromDatabase();
+        const activeProd = product || {
+          id: targetProductId,
+          name: 'Enterprise Items',
+          sku: 'ELEC-GEN',
+          targetSellingPrice: maxBudget / targetQuantity,
+        };
+        const session = engine.orchestrator.initiateSession({
+          negotiationId: negotiation.id,
+          product: activeProd,
+          quantity: Number(targetQuantity),
+          constraints: { maxBudget, maxDeliveryHours, targetResaleMargin },
+          buyerAgent: buyerAgent || { id: negotiation.buyerAgentId, name: `${buyerBusiness?.name || 'Enterprise'} Buyer Agent` },
+          buyerBusiness: buyerBusiness || { id: negotiation.buyerBusinessId, name: buyerBusiness?.name || 'Enterprise Buyer' },
+          eligibleParticipants: eligibleSellers,
+        });
+
+        // Save RFQ Message to database as Round 0
+        if (session.messages?.length > 0) {
+          const rfqMsg = session.messages[0];
+          await prisma.agentMessage.create({
+            data: {
+              negotiationId: negotiation.id,
+              agentId: buyerAgent?.id || negotiation.buyerAgentId,
+              roundNumber: 0,
+              senderRole: 'BUYER',
+              content: rfqMsg.content,
+              structuredProposal: rfqMsg.proposal || null,
+              securityStatus: 'VERIFIED',
+            },
+          });
+        }
+      } catch (engineErr) {
+        logger.warn(`Could not initialize engine session on RFQ creation: ${engineErr?.message}`);
+      }
     } catch (err) {
-      // High-fidelity fallback for offline or unseeded DB
       negotiation = {
         id: `neg-${Date.now()}`,
         title,
@@ -90,23 +190,22 @@ export class NegotiationService {
         maxBudget,
         maxDeliveryHours,
         targetResaleMargin,
-        currentRound: 1,
-        status: 'INITIATED',
+        currentRound: isEligibleFound ? 1 : 0,
+        status: initialStatus,
+        summary: initialSummary,
+        metadata,
         createdAt: new Date().toISOString(),
       };
     }
 
     if (io) {
-      io.emit('negotiation:created', negotiation);
+      io.emit('negotiation:created', { ...negotiation, eligibleParticipants: eligibleSellers });
     }
 
-    return negotiation;
+    return { ...negotiation, eligibleParticipants: eligibleSellers };
   }
 
-  /**
-   * Advances negotiation round: coordinates multi-agent reasoning, security scanning, persistence, and Socket.IO
-   */
-  static async advanceRound(negotiationId, currentRoundNumber = 1, user = null, io = null) {
+  static async advanceRound(negotiationId, currentRoundNumber = null, user = null, io = null) {
     const engine = getNegotiationEngine(io);
 
     let negotiation = null;
@@ -116,6 +215,12 @@ export class NegotiationService {
         include: { targetProduct: true, buyerBusiness: true },
       });
     } catch {}
+
+    if (negotiation && (negotiation.status === 'APPROVED' || negotiation.status === 'SETTLED')) {
+      const err = new Error(`Negotiation room [${negotiationId}] is closed because the transaction has already been approved and settled.`);
+      err.statusCode = 400;
+      throw err;
+    }
 
     const product = negotiation?.targetProduct || {
       id: 'prod-mock-1',
@@ -133,12 +238,26 @@ export class NegotiationService {
       targetResaleMargin: Number(negotiation?.targetResaleMargin || 25),
     };
 
+    // Determine current completed round dynamically from database
+    let lastCompletedRound = 0;
+    try {
+      const maxRound = await prisma.agentMessage.aggregate({
+        where: { negotiationId, roundNumber: { gt: 0 } },
+        _max: { roundNumber: true },
+      });
+      lastCompletedRound = maxRound?._max?.roundNumber || 0;
+    } catch {}
+
+    const roundToPass = (currentRoundNumber !== null && currentRoundNumber !== undefined && currentRoundNumber > 0)
+      ? Math.max(0, currentRoundNumber - 1)
+      : lastCompletedRound;
+
     // Execute through multi-agent engine
     const roundResult = await engine.advanceRound({
       negotiationId,
       product,
       quantity,
-      currentRound: currentRoundNumber,
+      currentRound: roundToPass,
       constraints,
     });
 
@@ -177,17 +296,37 @@ export class NegotiationService {
       const session = engine.orchestrator.sessions.get(negotiationId);
       const sessionMessages = session?.messages || [];
       for (const msg of sessionMessages) {
-        if (msg.roundNumber === nextRound || msg.roundNumber === currentRoundNumber) {
-          const role = msg.sender?.role || 'BUYER';
-          const sender = agentMap[role] || agentMap['BUYER'] || dbAgents[0];
-          if (sender) {
+        const msgRound = msg.roundNumber ?? nextRound;
+        const role = msg.sender?.role || 'BUYER';
+        const senderAgentId = msg.sender?.agentId || msg.agentId;
+        const sender = (senderAgentId && (agentMap[senderAgentId] || dbAgents.find((a) => a.id === senderAgentId))) ||
+          (role === 'BUYER' ? (negotiation?.buyerAgentId ? agentMap[negotiation.buyerAgentId] : agentMap['BUYER']) : agentMap[role]) ||
+          dbAgents[0];
+
+        if (sender) {
+          const existing = await prisma.agentMessage.findFirst({
+            where: {
+              negotiationId,
+              roundNumber: msgRound,
+              agentId: sender.id,
+            },
+          });
+          if (!existing) {
+            let cleanContent = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+            cleanContent = cleanContent
+              .replace(/```(?:json)?[\s\S]*?```/gi, '')
+              .replace(/\{[\s\r\n]*"unitPrice"[\s\S]*?\}/gi, '')
+              .replace(/\{[\s\r\n]*"intent"[\s\S]*?\}/gi, '')
+              .replace(/\n{3,}/g, '\n\n')
+              .trim();
+
             await prisma.agentMessage.create({
               data: {
                 negotiationId,
                 agentId: sender.id,
-                roundNumber: msg.roundNumber || nextRound,
+                roundNumber: msgRound,
                 senderRole: role,
-                content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+                content: cleanContent || (typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)),
                 structuredProposal: msg.proposal || null,
                 securityStatus: msg.securityValidation?.status === 'FLAGGED' ? 'SUSPICIOUS' : 'VERIFIED',
               },
@@ -201,7 +340,9 @@ export class NegotiationService {
       const persistedOffers = [];
 
       for (const offer of roundResult.offers || []) {
-        const seller = agentMap[offer.sellerType] || agentMap[offer.sellerAgentId] || dbAgents.find((a) => a.id === offer.sellerAgentId) || agentMap['SELLER_A_PRICE'] || dbAgents[1];
+        const seller = (offer.sellerAgentId && (agentMap[offer.sellerAgentId] || dbAgents.find((a) => a.id === offer.sellerAgentId))) ||
+          agentMap[offer.sellerType] ||
+          dbAgents[1];
         const isRec = Boolean(
           roundResult.recommendedOffer &&
           (roundResult.recommendedOffer.sellerAgentId === offer.sellerAgentId ||
@@ -243,7 +384,7 @@ export class NegotiationService {
 
       // If no offer was explicitly marked recommended yet convergence reached, pick highest utility clean offer
       if (!recommendedDbOffer && persistedOffers.length > 0) {
-        const cleanOffers = persistedOffers.filter((o) => !o.hiddenFeeDetected && o.status === 'PENDING');
+        const cleanOffers = persistedOffers.filter((o) => !o.hiddenFeeDetected && o.status === 'PENDING' && o.sellerType !== 'SELLER_C_MALICIOUS');
         if (cleanOffers.length > 0) {
           cleanOffers.sort((a, b) => (b.utilityScore || 0) - (a.utilityScore || 0));
           const best = cleanOffers[0];
@@ -270,7 +411,7 @@ export class NegotiationService {
       }
 
       // 4. Update Negotiation state
-      const isConcluded = !roundResult.convergence.continue && recommendedDbOffer;
+      const isConcluded = nextRound >= 3 || (!roundResult.convergence.continue && recommendedDbOffer);
       await prisma.negotiation.update({
         where: { id: negotiationId },
         data: {
@@ -279,6 +420,29 @@ export class NegotiationService {
           recommendedOfferId: recommendedDbOffer ? recommendedDbOffer.id : null,
         },
       });
+
+      // Attach all messages from DB with agent-to-business relations to roundResult
+      try {
+        const allDbMessages = await prisma.agentMessage.findMany({
+          where: { negotiationId },
+          include: { agent: { include: { business: true } } },
+          orderBy: { createdAt: 'asc' },
+        });
+        roundResult.messages = allDbMessages.map((m) => {
+          const isBuyerMsg = m.senderRole === 'BUYER';
+          return {
+            ...m,
+            sender: {
+              agentId: m.agentId,
+              role: m.senderRole,
+              name: m.agent?.name || (isBuyerMsg ? negotiation?.buyerAgent?.name : null),
+              businessId: m.agent?.businessId || (isBuyerMsg ? negotiation?.buyerBusinessId : null),
+              businessName: m.agent?.business?.name || (isBuyerMsg ? negotiation?.buyerBusiness?.name : null),
+            },
+            proposal: m.structuredProposal || m.proposal,
+          };
+        });
+      } catch {}
 
       // 5. Create pending transaction if deal reached
       if (isConcluded && recommendedDbOffer) {
@@ -293,7 +457,7 @@ export class NegotiationService {
             paymentMethod: 'MOCK_UPI',
             settlementStatus: 'PENDING_APPROVAL',
             humanApprovalRequired: true,
-            mockUpiVpa: 'prismwholesale@icici',
+            mockUpiVpa: `${(seller?.business?.name || seller?.name || 'supplier').toLowerCase().replace(/[^a-z0-9]/g, '')}@icici`,
           },
         });
 

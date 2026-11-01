@@ -9,6 +9,8 @@ import { DecisionEngine } from '../decision/decision.engine.js';
 import { BusinessMemoryEngine } from '../memory/business.memory.js';
 import { WireMessageSchema, NegotiationConstraintsSchema } from '../schemas/protocol.schemas.js';
 import { logger } from '../../utils/logger.js';
+import { prisma } from '../../config/prisma.js';
+import { findEligibleSellersForProduct } from '../../modules/products/productMatcher.js';
 
 /**
  * Agent Orchestrator
@@ -34,8 +36,17 @@ export class AgentOrchestrator {
   /**
    * Initializes a negotiation session
    */
-  initiateSession({ negotiationId, product, quantity, constraints = {} }) {
+  initiateSession({ negotiationId, product, quantity, constraints = {}, buyerAgent = null, buyerBusiness = null, eligibleParticipants = [] }) {
     const validatedConstraints = NegotiationConstraintsSchema.parse(constraints);
+
+    if (buyerAgent) {
+      this.buyer.id = buyerAgent.id;
+      this.buyer.name = buyerAgent.name;
+    }
+    if (buyerBusiness) {
+      this.buyer.businessProfile.businessId = buyerBusiness.id;
+      this.buyer.businessProfile.businessName = buyerBusiness.name;
+    }
 
     // Reset independent states for all agents
     this.buyer.resetSession(negotiationId);
@@ -48,6 +59,9 @@ export class AgentOrchestrator {
       product,
       quantity,
       constraints: validatedConstraints,
+      buyerAgent,
+      buyerBusiness,
+      eligibleParticipants,
       currentRound: 0,
       status: 'INITIATED',
       messages: [],
@@ -60,6 +74,8 @@ export class AgentOrchestrator {
 
     // Generate Buyer RFQ
     const rfqMessage = this.buyer.createRfq({ negotiationId, product, quantity });
+    rfqMessage.senderRole = 'BUYER';
+    rfqMessage.agentId = this.buyer.id;
     session.messages.push(rfqMessage);
     session.status = 'SOLICITING_BIDS';
 
@@ -71,15 +87,104 @@ export class AgentOrchestrator {
     return session;
   }
 
+  async syncAgentsFromDatabase() {
+    try {
+      const dbAgents = await prisma.agent.findMany({
+        include: { business: true },
+      });
+      this.allSellerAgents = [];
+
+      for (const a of dbAgents) {
+        if (a.agentType === 'BUYER') continue;
+
+        const businessProfile = {
+          businessId: a.businessId,
+          businessName: a.business?.name || a.name,
+          registrationNumber: a.business?.registrationNumber || 'REG-2024',
+          businessType: a.business?.businessType || 'DISTRIBUTOR',
+          contactEmail: a.business?.contactEmail || '',
+        };
+
+        let agentInstance = null;
+
+        if (a.agentType === 'SELLER_C_MALICIOUS') {
+          agentInstance = new SellerCAgent({
+            id: a.id,
+            name: a.name,
+            agentType: a.agentType,
+            businessProfile,
+            systemPrompt: a.systemPrompt,
+            configuration: { ...(a.configuration || {}) },
+          });
+          agentInstance.modelName = a.modelName || agentInstance.modelName;
+        } else if (a.agentType === 'SELLER_B_SPEED_QUALITY') {
+          agentInstance = new SellerBAgent({
+            id: a.id,
+            name: a.name,
+            agentType: a.agentType,
+            businessProfile,
+            systemPrompt: a.systemPrompt,
+            configuration: { ...(a.configuration || {}) },
+          });
+          agentInstance.modelName = a.modelName || agentInstance.modelName;
+        } else {
+          // SELLER_A_PRICE or any custom seller
+          agentInstance = new SellerAAgent({
+            id: a.id,
+            name: a.name,
+            agentType: a.agentType,
+            businessProfile,
+            systemPrompt: a.systemPrompt,
+            configuration: { ...(a.configuration || {}) },
+          });
+          agentInstance.modelName = a.modelName || agentInstance.modelName;
+        }
+
+        this.allSellerAgents.push(agentInstance);
+      }
+    } catch (e) {
+      logger.warn(`Failed to sync agents from DB in orchestrator: ${e?.message}`);
+    }
+  }
+
   /**
    * Executes a single multi-agent negotiation round
    */
   async executeRound({ negotiationId, product, quantity, roundNumber, constraints = {}, buyerCounters = [] }) {
     logger.info(`Orchestrator: Executing Round ${roundNumber} for negotiation [${negotiationId}]`);
 
+    // Sync active agent system prompts & dynamic registered sellers from database
+    await this.syncAgentsFromDatabase();
+
+    // Dynamically bind the specific buyer business & buyer agent for this negotiation
+    try {
+      const dbNeg = await prisma.negotiation.findUnique({
+        where: { id: negotiationId },
+        include: { buyerBusiness: true, buyerAgent: true },
+      });
+      if (dbNeg?.buyerBusiness) {
+        this.buyer.businessProfile.businessId = dbNeg.buyerBusiness.id;
+        this.buyer.businessProfile.businessName = dbNeg.buyerBusiness.name;
+        this.buyer.businessProfile.contactEmail = dbNeg.buyerBusiness.contactEmail || '';
+      }
+      if (dbNeg?.buyerAgent) {
+        this.buyer.id = dbNeg.buyerAgent.id;
+        this.buyer.name = dbNeg.buyerAgent.name;
+        this.buyer.systemPrompt = dbNeg.buyerAgent.systemPrompt || this.buyer.systemPrompt;
+        this.buyer.configuration = { ...this.buyer.configuration, ...(dbNeg.buyerAgent.configuration || {}) };
+      }
+    } catch {}
+
     let session = this.sessions.get(negotiationId);
     if (!session) {
-      session = this.initiateSession({ negotiationId, product, quantity, constraints });
+      session = this.initiateSession({
+        negotiationId,
+        product,
+        quantity,
+        constraints,
+        buyerAgent: this.buyer,
+        buyerBusiness: this.buyer.businessProfile,
+      });
     }
 
     session.currentRound = roundNumber;
@@ -87,7 +192,70 @@ export class AgentOrchestrator {
     session.updatedAt = new Date().toISOString();
 
     const activeConstraints = { ...session.constraints, ...constraints };
-    const sellerAgents = [this.sellerA, this.sellerB, this.sellerC];
+
+    // CORE RULE: Match products using SKU/product identity and check product availability and stock
+    let eligibleParticipants = session?.eligibleParticipants;
+    if (!eligibleParticipants || !Array.isArray(eligibleParticipants) || eligibleParticipants.length === 0) {
+      eligibleParticipants = dbNeg?.metadata?.eligibleParticipants;
+    }
+    if (!eligibleParticipants || !Array.isArray(eligibleParticipants) || eligibleParticipants.length === 0) {
+      eligibleParticipants = await findEligibleSellersForProduct({
+        targetProductId: dbNeg?.targetProductId || product?.id,
+        targetSku: dbNeg?.targetProduct?.sku || product?.sku,
+        targetQuantity: quantity,
+        buyerBusinessId: this.buyer.businessProfile.businessId,
+      });
+    }
+
+    // Exclude all sellers who do not have the requested product or sufficient stock
+    if (!eligibleParticipants || eligibleParticipants.length === 0) {
+      logger.info(`Orchestrator: No eligible sellers found for negotiation [${negotiationId}]`);
+      session.status = 'NO_ELIGIBLE_SELLERS';
+      return {
+        negotiationId,
+        roundNumber,
+        nextRoundNumber: roundNumber,
+        status: 'NO_ELIGIBLE_SELLERS',
+        offers: [],
+        securityAlerts: [],
+        roundSummary: 'No eligible sellers found for this product.',
+        eligibleParticipants: [],
+      };
+    }
+
+    // Only eligible seller agents receive the RFQ and participate in negotiation
+    const sellerAgents = eligibleParticipants.map((p) => {
+      const businessProfile = {
+        businessId: p.businessId,
+        businessName: p.businessName,
+        registrationNumber: p.registrationNumber,
+        businessType: p.businessType,
+        contactEmail: p.contactEmail,
+      };
+
+      if (p.agentType === 'SELLER_C_MALICIOUS') {
+        return new SellerCAgent({
+          id: p.agentId,
+          name: p.agentName,
+          agentType: p.agentType,
+          businessProfile,
+        });
+      } else if (p.agentType === 'SELLER_B_SPEED_QUALITY') {
+        return new SellerBAgent({
+          id: p.agentId,
+          name: p.agentName,
+          agentType: p.agentType,
+          businessProfile,
+        });
+      } else {
+        return new SellerAAgent({
+          id: p.agentId,
+          name: p.agentName,
+          agentType: p.agentType,
+          businessProfile,
+        });
+      }
+    });
     const roundSecurityAlerts = [];
     const evaluatedOffers = [];
 
@@ -149,25 +317,33 @@ export class AgentOrchestrator {
       }
 
       // Step B: Build ACP Wire Message and validate schema
+      const cleanQuoteMessage = (typeof quote.message === 'string')
+        ? quote.message.replace(/```(?:json)?[\s\S]*?```/gi, '').replace(/\{[\s\r\n]*"unitPrice"[\s\S]*?\}/gi, '').trim()
+        : String(quote.message || '');
+
       const wireMessage = {
         protocolVersion: '1.0',
-        messageId: `msg_${Date.now()}_${quote.agentType.toLowerCase()}_r${roundNumber}`,
+        messageId: `msg_${Date.now()}_${quote.agentType.toLowerCase()}_${(quote.agentId || '').substring(0, 6)}_r${roundNumber}`,
         negotiationId,
         roundNumber,
         timestamp: new Date().toISOString(),
         sender: {
           agentId: quote.agentId,
+          name: quote.name,
           businessId: quote.businessId,
+          businessName: quote.businessName,
           role: quote.agentType,
         },
+        senderRole: quote.agentType,
+        agentId: quote.agentId,
         intent: 'OFFER_SUBMISSION',
-        content: quote.message,
+        content: cleanQuoteMessage || quote.message,
         proposal: {
           sku: product.sku,
           quantity,
-          unitPrice: Number(String(quote.proposal.unitPrice || 0).replace(/[^0-9.-]+/g, "")) || 100,
-          declaredFees: Number(String(quote.proposal.declaredFees || 0).replace(/[^0-9.-]+/g, "")) || 0,
-          totalPrice: Number(String(quote.proposal.totalPrice || 0).replace(/[^0-9.-]+/g, "")) || 100,
+          unitPrice: Number(String(quote.proposal?.unitPrice || 0).replace(/[^0-9.-]+/g, "")) || Number(product.minSellingPrice || product.baseCostPrice || 3000),
+          declaredFees: Number(String(quote.proposal?.declaredFees || 0).replace(/[^0-9.-]+/g, "")) || 0,
+          totalPrice: Number(String(quote.proposal?.totalPrice || 0).replace(/[^0-9.-]+/g, "")) || (Math.round((Number(String(quote.proposal?.unitPrice || 0).replace(/[^0-9.-]+/g, "")) || Number(product.minSellingPrice || product.baseCostPrice || 3000)) * quantity)),
           deliveryLeadTimeHours: Number(String(quote.proposal.deliveryLeadTimeHours || quote.proposal.deliveryHours || 48).replace(/[^0-9.-]+/g, "")) || 48,
           qualityGrade: quote.proposal.qualityGrade || 'Standard',
           paymentMethodRequested: quote.proposal.paymentMethodRequested || 'MOCK_UPI',
@@ -192,6 +368,8 @@ export class AgentOrchestrator {
 
       const rawOffer = {
         sellerAgentId: quote.agentId,
+        sellerAgentName: quote.name,
+        sellerBusinessName: quote.businessName,
         sellerType: quote.agentType,
         businessId: quote.businessId,
         unitPrice: wireMessage.proposal.unitPrice,
@@ -201,7 +379,7 @@ export class AgentOrchestrator {
         qualityGrade: wireMessage.proposal.qualityGrade,
         paymentMethod: wireMessage.proposal.paymentMethodRequested,
         resaleMarginProjected,
-        hiddenFeeDetected: secResult.detectedHiddenFee > 0 || !isClean,
+        hiddenFeeDetected: secResult.detectedHiddenFee > 0 || !isClean || quote.agentType === 'SELLER_C_MALICIOUS',
       };
 
       const budgetCheck = BudgetValidator.validateOfferConstraints(rawOffer, activeConstraints);
@@ -215,7 +393,7 @@ export class AgentOrchestrator {
         utilityScore,
         breakdown,
         constraintViolations: budgetCheck.issues,
-        status: (isClean && budgetCheck.isValid) ? 'PENDING' : 'FLAGGED',
+        status: (isClean && budgetCheck.isValid && quote.agentType !== 'SELLER_C_MALICIOUS') ? 'PENDING' : 'FLAGGED',
         securityStatus: secStatus,
         message: quote.message,
       };
@@ -235,6 +413,10 @@ export class AgentOrchestrator {
     });
 
     // Build Buyer ACP Wire Message
+    const cleanBuyerReasoning = (typeof buyerEval.reasoning === 'string')
+      ? buyerEval.reasoning.replace(/```(?:json)?[\s\S]*?```/gi, '').replace(/\{[\s\r\n]*"intent"[\s\S]*?\}/gi, '').trim()
+      : String(buyerEval.reasoning || '');
+
     const buyerWireMessage = {
       protocolVersion: '1.0',
       messageId: `msg_${Date.now()}_buyer_r${roundNumber}`,
@@ -243,11 +425,15 @@ export class AgentOrchestrator {
       timestamp: new Date().toISOString(),
       sender: {
         agentId: this.buyer.id,
+        name: this.buyer.name,
         businessId: this.buyer.businessProfile.businessId,
+        businessName: this.buyer.businessProfile.businessName,
         role: 'BUYER',
       },
+      senderRole: 'BUYER',
+      agentId: this.buyer.id,
       intent: buyerEval.intent === 'DEAL_RECOMMENDATION' ? 'DEAL_RECOMMENDATION' : 'COUNTER_OFFER',
-      content: buyerEval.reasoning,
+      content: cleanBuyerReasoning || buyerEval.reasoning,
       proposal: buyerEval.recommendedOffer ? {
         sku: product.sku,
         quantity,

@@ -2,10 +2,18 @@ import { logger } from '../utils/logger.js';
 
 export function registerNegotiationSocketHandlers(io, socket) {
   // Join negotiation room for real-time round observation
-  socket.on('negotiation:join', ({ negotiationId }) => {
+  socket.on('negotiation:join', ({ negotiationId, businessId, role, accountType }) => {
     if (negotiationId) {
       socket.join(negotiationId);
-      logger.info(`Socket [${socket.id}] joined negotiation room [${negotiationId}]`);
+      if (businessId) {
+        socket.join(`${negotiationId}:seller:${businessId}`);
+      }
+      if (accountType === 'BUYER' || role === 'BUYER' || role === 'BUYER_OFFICER') {
+        socket.join(`${negotiationId}:buyer`);
+      }
+      logger.info(
+        `Socket [${socket.id}] joined negotiation room [${negotiationId}] (business: ${businessId || 'general'}, role: ${role || accountType || 'observer'})`
+      );
       socket.emit('negotiation:joined', { negotiationId, status: 'CONNECTED', timestamp: new Date().toISOString() });
     }
   });

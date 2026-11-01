@@ -40,8 +40,45 @@ export class SellerBAgent extends BaseAgent {
       this.recordReceivedMessage(buyerCounter);
     }
 
-    const catalogTarget = Number(product.targetSellingPrice);
-    const floorPrice = Number(product.minSellingPrice);
+    const bizName = this.businessProfile.businessName || this.name || 'SwiftQuality Logistics';
+
+    // 1. Resolve product strictly from this seller's database catalogue
+    const catalogueProduct = await this.resolveCatalogueProduct(product);
+    if (!catalogueProduct) {
+      const outOfStockMsg = `${bizName} cannot submit a quotation: ${product.name || 'Requested item'} is not in our active product catalogue. Please add this product to your Seller Product Catalogue to enable autonomous agent bidding.`;
+      const declinedProposal = {
+        unitPrice: 0,
+        quantity: 0,
+        declaredFees: 0,
+        totalPrice: 0,
+        deliveryLeadTimeHours: 0,
+        qualityGrade: 'Unavailable',
+        paymentMethodRequested: this.configuration.paymentMethod,
+        warrantyMonths: 0,
+        notes: 'Catalogue item not configured in database',
+        declined: true,
+      };
+      const quoteOutput = {
+        agentId: this.id,
+        name: this.name,
+        agentType: this.agentType,
+        businessId: this.businessProfile.businessId,
+        businessName: bizName,
+        roundNumber,
+        message: outOfStockMsg,
+        proposal: declinedProposal,
+        declined: true,
+      };
+      this.recordSentMessage(quoteOutput);
+      return quoteOutput;
+    }
+
+    // 2. Use real live catalogue pricing, floor price, stock & SLA
+    const activeProduct = catalogueProduct;
+    const catalogTarget = Number(activeProduct.targetSellingPrice);
+    const floorPrice = Number(activeProduct.minSellingPrice);
+    const deliveryLeadHours = Number(activeProduct.typicalLeadTimeHours || this.configuration.defaultDeliveryHours || 20);
+    const qualityGrade = activeProduct.qualityGrade || this.configuration.qualityGrade || 'Enterprise-Plus';
 
     // Conservative discount curve: 2% in Round 1, 3.5% in Round 2, 4.5% in Round 3+
     let discountRate = 0.02;
@@ -57,7 +94,7 @@ export class SellerBAgent extends BaseAgent {
     const previousOffer = this.state.offerHistory[this.state.offerHistory.length - 1] || null;
 
     const prompt = NEGOTIATION_PROMPTS.buildSellerQuotePrompt({
-      product,
+      product: activeProduct,
       quantity,
       roundNumber,
       buyerRequest,
@@ -66,40 +103,39 @@ export class SellerBAgent extends BaseAgent {
     });
 
     const responseText = await this.generateResponse(prompt, () => {
-      // Dynamic non-hardcoded fallback simulation
       if (roundNumber === 1) {
-        return `SwiftQuality Logistics submits our verified enterprise proposal for ${quantity}x ${product.name}.
+        return `${bizName} submits our verified enterprise proposal for ${quantity}x ${activeProduct.name}.
 Our commercial proposal is ₹${finalUnitPrice.toLocaleString()} per unit (Total: ₹${total.toLocaleString()}).
-Why SwiftQuality: Guaranteed ultra-fast ${this.configuration.defaultDeliveryHours}-hour delivery turnaround, certified ${this.configuration.qualityGrade} build grade, zero-downtime tolerance, and comprehensive ${this.configuration.warrantyMonths}-month replacement warranty.
+Why ${bizName}: Guaranteed ultra-fast ${deliveryLeadHours}-hour delivery turnaround, certified ${qualityGrade} build grade, zero-downtime tolerance, and comprehensive ${this.configuration.warrantyMonths}-month replacement warranty.
 \`\`\`json
 {
   "unitPrice": ${finalUnitPrice},
   "quantity": ${quantity},
   "declaredFees": 0,
   "totalPrice": ${total},
-  "deliveryLeadTimeHours": ${this.configuration.defaultDeliveryHours},
-  "qualityGrade": "${this.configuration.qualityGrade}",
+  "deliveryLeadTimeHours": ${deliveryLeadHours},
+  "qualityGrade": "${qualityGrade}",
   "paymentMethodRequested": "${this.configuration.paymentMethod}",
   "warrantyMonths": ${this.configuration.warrantyMonths},
-  "notes": "Guaranteed 20h expedited SLA with 24-month replacement warranty."
+  "notes": "Guaranteed ${deliveryLeadHours}h expedited SLA with 24-month replacement warranty."
 }
 \`\`\``;
       }
 
-      return `SwiftQuality Logistics acknowledges the Buyer's counter-offer in Round ${roundNumber}.
+      return `${bizName} acknowledges the Buyer's counter-offer in Round ${roundNumber}.
 While we cannot match low-grade wholesale pricing without compromising on speed and QA reliability, we are applying a courtesy concession to ₹${finalUnitPrice.toLocaleString()} per unit (Total: ₹${total.toLocaleString()}).
-We stand firmly behind our unmatched ${this.configuration.defaultDeliveryHours}-hour delivery commitment and Enterprise-Plus zero-defect guarantee.
+We stand firmly behind our unmatched ${deliveryLeadHours}-hour delivery commitment and ${qualityGrade} zero-defect guarantee.
 \`\`\`json
 {
   "unitPrice": ${finalUnitPrice},
   "quantity": ${quantity},
   "declaredFees": 0,
   "totalPrice": ${total},
-  "deliveryLeadTimeHours": ${this.configuration.defaultDeliveryHours},
-  "qualityGrade": "${this.configuration.qualityGrade}",
+  "deliveryLeadTimeHours": ${deliveryLeadHours},
+  "qualityGrade": "${qualityGrade}",
   "paymentMethodRequested": "${this.configuration.paymentMethod}",
   "warrantyMonths": ${this.configuration.warrantyMonths},
-  "notes": "Courtesy loyalty discount applied while safeguarding 20h expedited delivery and Enterprise-Plus QA."
+  "notes": "Courtesy loyalty discount applied while safeguarding ${deliveryLeadHours}h expedited delivery and ${qualityGrade} QA."
 }
 \`\`\``;
     });
@@ -109,17 +145,19 @@ We stand firmly behind our unmatched ${this.configuration.defaultDeliveryHours}-
       quantity,
       declaredFees: 0,
       totalPrice: total,
-      deliveryLeadTimeHours: this.configuration.defaultDeliveryHours,
-      qualityGrade: this.configuration.qualityGrade,
+      deliveryLeadTimeHours: deliveryLeadHours,
+      qualityGrade: qualityGrade,
       paymentMethodRequested: this.configuration.paymentMethod,
       warrantyMonths: this.configuration.warrantyMonths,
-      notes: 'Express 20h SLA enterprise terms',
+      notes: `Express ${deliveryLeadHours}h SLA enterprise terms`,
     };
 
     const quoteOutput = {
       agentId: this.id,
+      name: this.name,
       agentType: this.agentType,
       businessId: this.businessProfile.businessId,
+      businessName: bizName,
       roundNumber,
       message: responseText,
       proposal: parsedProposal,

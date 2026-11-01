@@ -5,8 +5,20 @@ import { NegotiationService } from '../services/negotiation.service.js';
 export async function getNegotiations(req, res, next) {
   try {
     let negotiations = [];
+    const user = req.user;
+    let whereClause = {};
+
+    if (user) {
+      if (user.accountType === 'SELLER' || user.role === 'SUPPLIER_REP') {
+        whereClause = {}; // Filter dynamically in post-query for metadata.eligibleParticipants
+      } else if ((user.accountType === 'BUYER' || user.role === 'BUYER_OFFICER') && user.businessId) {
+        whereClause = { buyerBusinessId: user.businessId };
+      }
+    }
+
     try {
       negotiations = await prisma.negotiation.findMany({
+        where: whereClause,
         include: {
           targetProduct: true,
           buyerAgent: { select: { name: true, agentType: true } },
@@ -18,7 +30,13 @@ export async function getNegotiations(req, res, next) {
       // Fallback
     }
 
-
+    if (user && (user.accountType === 'SELLER' || user.role === 'SUPPLIER_REP') && user.businessId) {
+      negotiations = negotiations.filter((n) => {
+        const hasOffer = n.offers?.some((o) => o.sellerBusinessId === user.businessId);
+        const hasEligibility = n.metadata?.eligibleParticipants?.some((p) => p.businessId === user.businessId);
+        return hasOffer || hasEligibility;
+      });
+    }
 
     return sendSuccess(res, negotiations, 'Negotiations retrieved');
   } catch (error) {
@@ -30,14 +48,21 @@ export async function getNegotiationById(req, res, next) {
   try {
     const { id } = req.params;
     let negotiation = null;
+    const isSeller = req.user?.accountType === 'SELLER' || req.user?.role === 'SUPPLIER_REP';
+    const sellerBizId = req.user?.businessId;
 
     try {
       negotiation = await prisma.negotiation.findUnique({
         where: { id },
         include: {
           targetProduct: true,
-          offers: { include: { sellerAgent: true } },
-          agentMessages: { orderBy: { createdAt: 'asc' } },
+          buyerBusiness: true,
+          buyerAgent: true,
+          offers: { include: { sellerAgent: true, sellerBusiness: true } },
+          agentMessages: {
+            include: { agent: { include: { business: true } } },
+            orderBy: { createdAt: 'asc' },
+          },
           securityEvents: true,
         },
       });
@@ -49,10 +74,93 @@ export async function getNegotiationById(req, res, next) {
       return sendError(res, 'Negotiation not found', 404, 'NotFound');
     }
 
-    // Format messages alias
-    const messages = negotiation.agentMessages || negotiation.messages || [];
+    // Role-based data isolation: Seller can only see their own AI agent & conversation
+    if (isSeller && sellerBizId) {
+      let sellerAgent = null;
+      try {
+        sellerAgent = await prisma.agent.findFirst({
+          where: { businessId: sellerBizId },
+        });
+      } catch {}
 
-    return sendSuccess(res, { ...negotiation, messages }, 'Negotiation details retrieved');
+      const sellerRole = sellerAgent?.agentType;
+      const sellerAgentId = sellerAgent?.id;
+
+      // Filter offers: Seller ONLY sees their own offers
+      negotiation.offers = (negotiation.offers || []).filter(
+        (o) => o.sellerBusinessId === sellerBizId
+      );
+
+      // Filter messages: Seller ONLY sees Buyer RFQ / counters and messages between their own agent and Buyer
+      // Competing sellers' messages are strictly stripped!
+      negotiation.agentMessages = (negotiation.agentMessages || []).filter((m) => {
+        if (m.senderRole === 'BUYER') {
+          return true;
+        }
+        if (sellerAgentId && m.agentId === sellerAgentId) {
+          return true;
+        }
+        if (sellerBizId && m.agent?.businessId === sellerBizId) {
+          return true;
+        }
+        return false;
+      });
+
+      // Filter security events: Only show events regarding this seller's agent
+      negotiation.securityEvents = (negotiation.securityEvents || []).filter(
+        (e) => e.offendingAgentId === sellerAgentId
+      );
+
+      // Redact competitor recommendation
+      if (negotiation.recommendedOfferId) {
+        const isMine = negotiation.offers.some((o) => o.id === negotiation.recommendedOfferId);
+        if (!isMine) {
+          negotiation.recommendedOfferId = null;
+          if (negotiation.status === 'DEAL_RECOMMENDED' || negotiation.status === 'PENDING_HUMAN_APPROVAL') {
+            negotiation.summary = 'The procurement session concluded. Another supplier offer was recommended by the buyer agent.';
+          }
+        }
+      }
+    }
+
+    // Format messages alias with rich sender profile
+    const messages = (negotiation.agentMessages || []).map((m) => {
+      const isBuyerMsg = m.senderRole === 'BUYER';
+      const resolvedAgentName = m.agent?.name || (isBuyerMsg ? negotiation.buyerAgent?.name : null);
+      const resolvedBizId = m.agent?.businessId || (isBuyerMsg ? negotiation.buyerBusinessId : null);
+      const resolvedBizName = m.agent?.business?.name || (isBuyerMsg ? negotiation.buyerBusiness?.name : null);
+
+      return {
+        ...m,
+        agentId: m.agentId,
+        senderRole: m.senderRole,
+        sender: {
+          agentId: m.agentId,
+          role: m.senderRole,
+          name: resolvedAgentName,
+          businessId: resolvedBizId,
+          businessName: resolvedBizName,
+        },
+        proposal: m.structuredProposal || m.proposal,
+      };
+    });
+
+    const eligibleParticipants = negotiation.metadata?.eligibleParticipants || [];
+    let isEligible = true;
+    let ineligibilityNotice = null;
+
+    if (isSeller && sellerBizId) {
+      isEligible = eligibleParticipants.some((p) => p.businessId === sellerBizId);
+      if (!isEligible) {
+        ineligibilityNotice = `Your organization is not eligible to participate in this negotiation: You do not have [${negotiation.targetProduct?.name || 'this product'}] (SKU: ${negotiation.targetProduct?.sku}) with at least ${negotiation.targetQuantity} available units in your product catalogue.`;
+      }
+    }
+
+    return sendSuccess(
+      res,
+      { ...negotiation, messages, eligibleParticipants, isEligible, ineligibilityNotice },
+      'Negotiation details retrieved'
+    );
   } catch (error) {
     next(error);
   }
@@ -84,10 +192,16 @@ export async function advanceNegotiationRound(req, res, next) {
 export async function getOffersByNegotiationId(req, res, next) {
   try {
     const { id } = req.params;
+    const isSeller = req.user?.accountType === 'SELLER' || req.user?.role === 'SUPPLIER_REP';
+    const whereClause = { negotiationId: id };
+    if (isSeller && req.user?.businessId) {
+      whereClause.sellerBusinessId = req.user.businessId;
+    }
+
     let offers = [];
     try {
       offers = await prisma.offer.findMany({
-        where: { negotiationId: id },
+        where: whereClause,
         include: { sellerAgent: { select: { name: true, agentType: true } } },
         orderBy: { roundNumber: 'desc' },
       });
@@ -101,102 +215,27 @@ export async function getOffersByNegotiationId(req, res, next) {
 
 export async function getOfferComparison(req, res, next) {
   try {
+    const isSeller = req.user?.accountType === 'SELLER' || req.user?.role === 'SUPPLIER_REP';
+    if (isSeller) {
+      return sendError(
+        res,
+        'Access denied: Cross-supplier offer comparison is strictly restricted to authorized Buyer officers.',
+        403,
+        'Forbidden'
+      );
+    }
+
     const { id } = req.params;
-    let negotiation = null;
-    let offers = [];
+    const offers = await prisma.offer.findMany({
+      where: { negotiationId: id },
+      include: {
+        sellerAgent: { select: { name: true, agentType: true, trustScore: true } },
+        product: true,
+      },
+      orderBy: { utilityScore: 'desc' },
+    });
 
-    try {
-      negotiation = await prisma.negotiation.findUnique({
-        where: { id },
-        include: { targetProduct: true },
-      });
-      offers = await prisma.offer.findMany({
-        where: { negotiationId: id },
-        include: {
-          sellerAgent: { select: { id: true, name: true, agentType: true } },
-          sellerBusiness: { select: { id: true, name: true } },
-        },
-        orderBy: [{ roundNumber: 'desc' }, { utilityScore: 'desc' }],
-      });
-    } catch (e) {
-      // fallback
-    }
-
-    if (negotiation && offers.length > 0) {
-      const latestRound = offers[0].roundNumber;
-      const latestOffers = offers.filter((o) => o.roundNumber === latestRound);
-      const maxBudget = Number(negotiation.maxBudget || 50000);
-      const maxDelivery = negotiation.maxDeliveryHours || 48;
-
-      const formattedOffers = latestOffers.map((o) => {
-        const totalPrice = Number(o.totalPrice);
-        const deliveryHours = o.deliveryHours;
-        const withinBudget = totalPrice <= maxBudget;
-        const withinSla = deliveryHours <= maxDelivery;
-
-        return {
-          id: o.id,
-          agentId: o.sellerAgent?.id || o.sellerAgentId,
-          sellerName: o.sellerAgent?.name || 'Seller Agent',
-          name: o.sellerAgent?.name || 'Seller Agent',
-          businessName: o.sellerBusiness?.name || 'Supplier Partner',
-          strategy: o.sellerAgent?.agentType === 'SELLER_A_PRICE' ? 'Low Margin / Price Priority' : (o.sellerAgent?.agentType === 'SELLER_B_SPEED_QUALITY' ? 'Speed & Premium Quality Priority' : 'Adversarial Simulation'),
-          unitPrice: Number(o.unitPrice),
-          quantity: o.quantity,
-          totalPrice,
-          deliveryHours,
-          qualityGrade: o.qualityGrade,
-          resaleMarginProjected: Number(o.resaleMarginProjected || 20),
-          utilityScore: o.utilityScore || 0,
-          withinBudget,
-          withinSla,
-          securityStatus: o.hiddenFeeDetected ? 'FLAGGED_HIDDEN_FEE' : 'CLEAN',
-          isRecommended: o.isRecommended,
-          flagReason: o.hiddenFeeDetected ? 'Hidden fee or abnormal price variance detected' : null,
-        };
-      });
-
-      const recommended = formattedOffers.find((o) => o.isRecommended) || formattedOffers[0];
-      const budgetSaved = maxBudget - (recommended ? recommended.totalPrice : 0);
-
-      const comparison = {
-        negotiationId: id,
-        roundNumber: latestRound,
-        constraints: {
-          maxBudget,
-          maxDeliveryHours: maxDelivery,
-          minMargin: Number(negotiation.targetResaleMargin || 25),
-        },
-        offers: formattedOffers,
-        recommendationSummary: recommended
-          ? {
-              winnerAgentId: recommended.agentId,
-              sellerName: recommended.sellerName,
-              recommendedPrice: recommended.totalPrice,
-              budgetSaved: budgetSaved > 0 ? budgetSaved : 0,
-              reasoning: `${recommended.sellerName} satisfies all constraints with utility score ${recommended.utilityScore} and projected resale margin ${recommended.resaleMarginProjected}%.`,
-            }
-          : null,
-      };
-
-      return sendSuccess(res, comparison, 'Offer comparison matrix generated from database');
-    }
-
-    if (negotiation) {
-      return sendSuccess(res, {
-        negotiationId: id,
-        roundNumber: negotiation.currentRound || 0,
-        constraints: {
-          maxBudget: Number(negotiation.maxBudget || 0),
-          maxDeliveryHours: negotiation.maxDeliveryHours || 48,
-          minMargin: Number(negotiation.targetResaleMargin || 25),
-        },
-        offers: [],
-        recommendationSummary: null,
-      }, 'No offers recorded yet for this negotiation');
-    }
-
-    return sendError(res, 'Negotiation not found', 404, 'NotFound');
+    return sendSuccess(res, offers, 'Offer comparison matrix retrieved');
   } catch (error) {
     next(error);
   }

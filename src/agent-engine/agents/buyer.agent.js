@@ -8,7 +8,7 @@ export class BuyerAgent extends BaseAgent {
   constructor(config = {}) {
     super({
       id: config.id || 'agent_buyer_apex',
-      name: config.name || 'Apex Autonomous Buyer (Gemini-2.0)',
+      name: config.name || 'Apex Autonomous Buyer',
       agentType: 'BUYER',
       businessProfile: {
         businessId: 'biz_apex_retail',
@@ -40,7 +40,9 @@ export class BuyerAgent extends BaseAgent {
     const targetRetailPrice = Number(product.targetSellingPrice);
     const maxBudget = this.configuration.maxBudget;
 
-    const content = `Apex Retail Enterprises is soliciting competitive wholesale proposals for ${quantity} units of ${product.name} (SKU: ${product.sku}).
+    const bizName = this.businessProfile.businessName || this.name || 'Enterprise Buyer';
+
+    const content = `${bizName} is soliciting competitive wholesale proposals for ${quantity} units of ${product.name} (SKU: ${product.sku}).
 Commercial Constraints: Hard expenditure ceiling of ₹${maxBudget.toLocaleString()}, maximum delivery lead time of ${this.configuration.maxDeliveryHours} hours, payment via verified platform MOCK_UPI. All proposals must include certified quality grades and transparent warranty terms.`;
 
     const rfqMessage = {
@@ -51,7 +53,9 @@ Commercial Constraints: Hard expenditure ceiling of ₹${maxBudget.toLocaleStrin
       timestamp: new Date().toISOString(),
       sender: {
         agentId: this.id,
+        name: this.name,
         businessId: this.businessProfile.businessId,
+        businessName: bizName,
         role: 'BUYER',
       },
       intent: 'RFQ_INITIATION',
@@ -132,8 +136,10 @@ Commercial Constraints: Hard expenditure ceiling of ₹${maxBudget.toLocaleStrin
       if (isExtraordinary || isUtilityHigh || isLastRound) {
         // Recommend deal
         const winnerRole = topOffer.sellerType;
+        const winnerName = topOffer.sellerBusinessName || topOffer.sellerAgentName || winnerRole;
         const budgetSaved = this.configuration.maxBudget - topOffer.totalPrice;
-        return `Apex Retail Procurement concludes Round ${roundNumber}. Supplier [${winnerRole}] satisfies all corporate mandates with a top utility score of ${topOffer.utilityScore}/100.
+        const buyerOrg = this.businessProfile.businessName || this.name || 'Enterprise Procurement';
+        return `${buyerOrg} concludes Round ${roundNumber}. Supplier [${winnerName}] satisfies all corporate mandates with a top utility score of ${topOffer.utilityScore}/100.
 Commercial Highlights: Total investment of ₹${topOffer.totalPrice.toLocaleString()} (saving ₹${budgetSaved.toLocaleString()} under our ₹${this.configuration.maxBudget.toLocaleString()} ceiling), projected gross resale margin of ${topMargin}%, fulfillment within ${topOffer.deliveryHours} hours, and verified zero-trust security clearance.
 \`\`\`json
 {
