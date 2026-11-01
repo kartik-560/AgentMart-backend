@@ -11,7 +11,9 @@
     "db:push": "prisma db push",
     "db:seed": "node prisma/seed.js",
     "test": "node --test tests/**/*.test.js",
-    "demo": "node src/agent-engine/examples/demo.negotiation.js"
+    "demo": "node src/agent-engine/examples/demo.negotiation.js",
+    "build": "prisma generate",
+    "vercel-build": "prisma generate"
   },
   "keywords": [
     "b2b",
